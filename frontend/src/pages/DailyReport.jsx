@@ -1,17 +1,16 @@
-import React, { useEffect, useMemo, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useState } from "react";
 import { api } from "@/lib/api";
 import { useAuth } from "@/lib/auth";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import { Calendar as CalendarUI } from "@/components/ui/calendar";
-import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { toast } from "sonner";
 import {
   Calendar, Truck, IndianRupee, Package, Phone, MapPin, Printer, ChevronDown, ChevronRight, Save, Tag, Lock, Pencil, ListChecks,
 } from "lucide-react";
 import IstBadge from "@/components/IstBadge";
 import DispatchEditDialog from "@/components/DispatchEditDialog";
+import ReportDatePicker from "@/components/ReportDatePicker";
 import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
 import TransportRoutes from "@/pages/TransportRoutes";
 
@@ -68,8 +67,26 @@ export default function DailyReport() {
   // Full-dispatch edit dialog (items + GR + bill + bags) state
   const [editingDispatch, setEditingDispatch] = useState(null);
   // Local mirror so the picker label can update without re-fetch
-  const [datePopoverOpen, setDatePopoverOpen] = useState(false);
-  const [endPopoverOpen, setEndPopoverOpen] = useState(false);
+  // Stable callbacks passed to the isolated (memoized) ReportDatePicker so
+  // opening/navigating the calendar never re-renders this large report page.
+  const handlePickDate = useCallback((next) => {
+    setDate(next);
+    setEndDate((prev) => (prev < next ? next : prev));
+  }, []);
+  const handlePickEndDate = useCallback((next) => {
+    let rejected = false;
+    setDate((start) => {
+      if (next < start) {
+        toast.error("End date start date se pehle nahi ho sakti");
+        rejected = true;
+        return start;
+      }
+      return start;
+    });
+    if (rejected) return false;
+    setEndDate(next);
+    return true;
+  }, []);
 
   const dispatchEdit = (did, field) => edits[`dispatch:${did}`]?.[field];
   const customerEdit = (cid, field) => edits[`customer:${cid}`]?.[field];
@@ -228,20 +245,29 @@ export default function DailyReport() {
   // we sort dispatches by slip_no DESC, then sort the groups themselves
   // by their max slip_no DESC. New dispatches therefore always surface
   // first instead of forcing operators to scroll/search the page.
-  const groups = (() => {
+  const groups = useMemo(() => {
     const raw = data?.groups || [];
+    const isRange = !!data?.range_mode;
     const slipNo = (d) => Number(d?.slip_no ?? 0);
     return raw
       .map((g) => ({
         ...g,
+        // Unique key per rendered block. In range mode the same party can
+        // appear once per day, so include the day to keep React keys and
+        // collapse state distinct.
+        _gkey: isRange && g.day ? `${g.day}|${g.customer_id}` : g.customer_id,
         dispatches: [...(g.dispatches || [])].sort((a, b) => slipNo(b) - slipNo(a)),
       }))
       .sort((a, b) => {
+        // Range mode: newest day first, then newest slip within the day.
+        if (isRange && (a.day || "") !== (b.day || "")) {
+          return (b.day || "").localeCompare(a.day || "");
+        }
         const aMax = Math.max(0, ...((a.dispatches || []).map(slipNo)));
         const bMax = Math.max(0, ...((b.dispatches || []).map(slipNo)));
         return bMax - aMax;
       });
-  })();
+  }, [data]);
 
   const toggle = (cid) => setCollapsed((c) => ({ ...c, [cid]: !c[cid] }));
 
@@ -387,86 +413,19 @@ body { padding: 12mm; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI"
               </div>
             </div>
             <div className="flex items-center gap-2 mt-1 flex-wrap">
-              <Popover open={datePopoverOpen} onOpenChange={setDatePopoverOpen}>
-                <PopoverTrigger asChild>
-                  <Button
-                    variant="outline"
-                    data-testid="report-date-input"
-                    className="h-10 rounded-sm border-slate-300 bg-white font-mono-num text-slate-900 pl-9 pr-3 justify-start relative min-w-[150px]"
-                  >
-                    <Calendar className="absolute left-2.5 top-1/2 -translate-y-1/2 w-4 h-4 text-slate-400 pointer-events-none" />
-                    {date}
-                  </Button>
-                </PopoverTrigger>
-                <PopoverContent
-                  className="w-auto p-0 rounded-sm"
-                  align="start"
-                  data-testid="report-date-popover"
-                >
-                  <CalendarUI
-                    mode="single"
-                    size="lg"
-                    selected={(() => {
-                      const [y, m, d] = (date || "").split("-").map(Number);
-                      return y ? new Date(y, m - 1, d) : new Date();
-                    })()}
-                    onSelect={(d) => {
-                      if (!d) return;
-                      const y = d.getFullYear();
-                      const m = String(d.getMonth() + 1).padStart(2, "0");
-                      const dd = String(d.getDate()).padStart(2, "0");
-                      const next = `${y}-${m}-${dd}`;
-                      setDate(next);
-                      if (mode === "range" && endDate < next) setEndDate(next);
-                      setDatePopoverOpen(false);
-                    }}
-                    initialFocus
-                  />
-                </PopoverContent>
-              </Popover>
+              <ReportDatePicker
+                value={date}
+                onSelect={handlePickDate}
+                testIdPrefix="report-date"
+              />
               {mode === "range" && (
                 <>
                   <span className="text-xs font-bold text-slate-400 uppercase">to</span>
-                  <Popover open={endPopoverOpen} onOpenChange={setEndPopoverOpen}>
-                    <PopoverTrigger asChild>
-                      <Button
-                        variant="outline"
-                        data-testid="report-end-date-input"
-                        className="h-10 rounded-sm border-slate-300 bg-white font-mono-num text-slate-900 pl-9 pr-3 justify-start relative min-w-[150px]"
-                      >
-                        <Calendar className="absolute left-2.5 top-1/2 -translate-y-1/2 w-4 h-4 text-slate-400 pointer-events-none" />
-                        {endDate}
-                      </Button>
-                    </PopoverTrigger>
-                    <PopoverContent
-                      className="w-auto p-0 rounded-sm"
-                      align="start"
-                      data-testid="report-end-date-popover"
-                    >
-                      <CalendarUI
-                        mode="single"
-                        size="lg"
-                        selected={(() => {
-                          const [y, m, d] = (endDate || "").split("-").map(Number);
-                          return y ? new Date(y, m - 1, d) : new Date();
-                        })()}
-                        onSelect={(d) => {
-                          if (!d) return;
-                          const y = d.getFullYear();
-                          const m = String(d.getMonth() + 1).padStart(2, "0");
-                          const dd = String(d.getDate()).padStart(2, "0");
-                          const next = `${y}-${m}-${dd}`;
-                          if (next < date) {
-                            toast.error("End date start date se pehle nahi ho sakti");
-                            return;
-                          }
-                          setEndDate(next);
-                          setEndPopoverOpen(false);
-                        }}
-                        initialFocus
-                      />
-                    </PopoverContent>
-                  </Popover>
+                  <ReportDatePicker
+                    value={endDate}
+                    onSelect={handlePickEndDate}
+                    testIdPrefix="report-end-date"
+                  />
                 </>
               )}
               <Button
@@ -519,8 +478,19 @@ body { padding: 12mm; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI"
         </div>
       ) : (
         <div className="space-y-3">
-          {groups.map((g) => {
-            const isCollapsed = !!collapsed[g.customer_id];
+          {groups.map((g, gIdx) => {
+            const gkey = g._gkey || g.customer_id;
+            const isRange = !!data?.range_mode;
+            const prevDay = gIdx > 0 ? (groups[gIdx - 1].day || "") : null;
+            const showDateHeader = isRange && g.day && g.day !== prevDay;
+            const fmtDay = (ymd) => {
+              const [y, m, dd] = (ymd || "").split("-").map(Number);
+              if (!y) return ymd;
+              return new Date(y, m - 1, dd).toLocaleDateString("en-IN", {
+                weekday: "short", day: "2-digit", month: "short", year: "numeric",
+              });
+            };
+            const isCollapsed = !!collapsed[gkey];
             // Task 2 — color-code every party group by whether it has ALL
             // required bookkeeping fields: private_mark (party), bag_count
             // (party — stored on first dispatch), and every dispatch under
@@ -575,16 +545,30 @@ body { padding: 12mm; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI"
                   billRequired && !allBillOk && "bill amt",
                 ].filter(Boolean);
             return (
-              <section
-                key={g.customer_id}
-                className={sectionClass}
-                data-testid={`report-group-${g.customer_id}`}
-                data-report-complete={isPartyComplete ? "yes" : "no"}
-              >
+              <React.Fragment key={gkey}>
+                {showDateHeader && (
+                  <div
+                    className="flex items-center gap-3 pt-4 pb-1 first:pt-0"
+                    data-testid={`report-date-header-${g.day}`}
+                  >
+                    <div className="flex items-center gap-2 px-3 py-1.5 rounded-sm bg-slate-900 text-white">
+                      <Calendar className="w-4 h-4" />
+                      <span className="font-heading font-bold text-sm tracking-wide">
+                        {fmtDay(g.day)}
+                      </span>
+                    </div>
+                    <div className="flex-1 h-px bg-slate-200" />
+                  </div>
+                )}
+                <section
+                  className={sectionClass}
+                  data-testid={`report-group-${gkey}`}
+                  data-report-complete={isPartyComplete ? "yes" : "no"}
+                >
                 <button
-                  onClick={() => toggle(g.customer_id)}
+                  onClick={() => toggle(gkey)}
                   className={headerClass}
-                  data-testid={`report-group-toggle-${g.customer_id}`}
+                  data-testid={`report-group-toggle-${gkey}`}
                 >
                   {isCollapsed ? (
                     <ChevronRight className="w-4 h-4 text-slate-500 print:hidden" />
@@ -1035,7 +1019,8 @@ body { padding: 12mm; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI"
                   </div>
                   </>
                 )}
-              </section>
+                </section>
+              </React.Fragment>
             );
           })}
         </div>

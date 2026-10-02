@@ -1,753 +1,845 @@
 #!/usr/bin/env python3
 """
-Backend API Test Suite for Factory ERP - Railway Crossing Avoidance + Flyover CRUD
-Tests the fix for "Avoid railway crossing" and the new "Mark flyover" feature
+Comprehensive test for Add/Edit/Delete action permissions (30 keys, 10 modules).
+Tests that:
+1. zzqa_user WITHOUT a key gets 403
+2. zzqa_user WITH the key gets allowed (2xx or 4xx validation, NOT 403)
+3. Keys are independent (add doesn't grant edit/delete)
+4. zzqa_admin can do all operations
+5. PATCH permissions endpoint accepts all 30 keys and rejects invalid keys
+6. Cleans up all ZZQA test records at the end
 """
 
 import requests
 import json
-import subprocess
-from typing import Dict, Any, Optional, List
+import os
+from typing import Dict, List, Tuple, Optional
 
 # Backend URL from environment
-BASE_URL = "https://app-preview-3333.preview.emergentagent.com/api"
+BACKEND_URL = os.getenv("REACT_APP_BACKEND_URL", "https://atomic-email.preview.emergentagent.com")
+API_BASE = f"{BACKEND_URL}/api"
 
-class Colors:
-    GREEN = '\033[92m'
-    RED = '\033[91m'
-    YELLOW = '\033[93m'
-    BLUE = '\033[94m'
-    END = '\033[0m'
+# Test accounts
+ZZQA_ADMIN = {"email": "zzqa_admin", "password": "QaTest@123"}
+ZZQA_USER = {"email": "zzqa_user", "password": "QaTest@123"}
+ZZQA_ADMIN_ID = "cdeda40f-2741-4690-80a3-11d543467fb7"
+ZZQA_USER_ID = "d166924d-8b22-40d7-9d47-d273a0beaa08"
 
-def log_success(msg: str):
-    print(f"{Colors.GREEN}✓ {msg}{Colors.END}")
+# Nav keys that should always be included
+NAV_KEYS = [
+    "dashboard", "orders", "newOrder", "dispatch", "purchaseCenter", 
+    "dispatchLedger", "vendorLedger", "dailyReport", "customers", 
+    "products", "rawMaterials", "suppliers", "priceLists", "vendorPriceLists"
+]
 
-def log_error(msg: str):
-    print(f"{Colors.RED}✗ {msg}{Colors.END}")
+# All 30 action permission keys (10 modules × 3 actions)
+ALL_ACTION_KEYS = [
+    "add:customers", "edit:customers", "delete:customers",
+    "add:products", "edit:products", "delete:products",
+    "add:rawMaterials", "edit:rawMaterials", "delete:rawMaterials",
+    "add:suppliers", "edit:suppliers", "delete:suppliers",
+    "add:vendorLedger", "edit:vendorLedger", "delete:vendorLedger",
+    "add:customerLedger", "edit:customerLedger", "delete:customerLedger",
+    "add:orders", "edit:orders", "delete:orders",
+    "add:dispatch", "edit:dispatch", "delete:dispatch",
+    "add:priceLists", "edit:priceLists", "delete:priceLists",
+    "add:vendorPriceLists", "edit:vendorPriceLists", "delete:vendorPriceLists",
+]
 
-def log_info(msg: str):
-    print(f"{Colors.BLUE}ℹ {msg}{Colors.END}")
+# Track created test records for cleanup
+created_records = {
+    "customers": [],
+    "products": [],
+    "items": [],
+    "rawMaterials": [],
+    "suppliers": [],
+    "priceLists": [],
+    "vendorPriceLists": [],
+    "orders": [],
+    "dispatches": [],
+    "payments": [],
+    "saleReturns": [],
+    "supplierPurchases": [],
+    "supplierPayments": [],
+    "purchaseReturns": [],
+}
 
-def log_warning(msg: str):
-    print(f"{Colors.YELLOW}⚠ {msg}{Colors.END}")
+# Test results
+test_results = []
 
-def check_backend_logs():
-    """Check backend logs for errors"""
-    try:
-        result = subprocess.run(
-            ["bash", "-c", "tail -n 100 /var/log/supervisor/backend.*.log"],
-            capture_output=True,
-            text=True,
-            timeout=5
-        )
-        
-        if result.returncode == 0 and result.stdout:
-            logs = result.stdout
-            # Check for critical errors related to railway crossing functions
-            error_keywords = [
-                "Traceback",
-                "_build_avoidance_route",
-                "_crossings_on",
-                "_rail_line_hits",
-                "_fetch_railway_features",
-                "create_flyover",
-                "Exception in"
-            ]
-            
-            found_errors = False
-            for keyword in error_keywords:
-                if keyword in logs:
-                    found_errors = True
-                    break
-            
-            if found_errors:
-                log_warning("Found relevant errors in backend logs:")
-                lines = logs.split('\n')
-                for line in lines[-30:]:
-                    if line.strip():
-                        print(f"  {line}")
-                return logs
-        return None
-    except Exception as e:
-        log_warning(f"Could not read backend logs: {e}")
-        return None
 
-def test_health_endpoint():
-    """Test 0: Health endpoint"""
-    print("\n" + "="*70)
-    print("TEST 0: Health Endpoint")
-    print("="*70)
-    
-    try:
-        log_info(f"GET {BASE_URL.replace('/api', '')}/health")
-        response = requests.get(f"{BASE_URL.replace('/api', '')}/health", timeout=10)
-        
-        log_info(f"Status: {response.status_code}")
-        
-        if response.status_code == 200:
-            log_success("Health endpoint returned 200")
-            return True
-        else:
-            log_error(f"Health endpoint returned {response.status_code}")
-            return False
-    except Exception as e:
-        log_error(f"Health endpoint failed: {e}")
-        return False
+def login(credentials: Dict[str, str]) -> str:
+    """Login and return JWT token"""
+    resp = requests.post(f"{API_BASE}/auth/login", json=credentials)
+    if resp.status_code != 200:
+        raise Exception(f"Login failed: {resp.status_code} {resp.text}")
+    data = resp.json()
+    return data["token"]
 
-def test_admin_login():
-    """Test 1: Admin login to get auth token"""
-    print("\n" + "="*70)
-    print("TEST 1: Admin Login")
-    print("="*70)
-    
-    payload = {
-        "email": "admin",
-        "password": "admin123"
+
+def set_user_permissions(admin_token: str, user_id: str, permissions: List[str]) -> bool:
+    """Set user permissions using admin token"""
+    headers = {"Authorization": f"Bearer {admin_token}"}
+    resp = requests.patch(
+        f"{API_BASE}/users/{user_id}/permissions",
+        json={"permissions": permissions},
+        headers=headers
+    )
+    return resp.status_code == 200
+
+
+def test_permission_key(
+    key: str,
+    endpoint: str,
+    method: str,
+    body: Optional[Dict] = None,
+    user_token: str = None,
+    admin_token: str = None,
+    test_name: str = "",
+    expect_403_without: bool = True,
+    expect_allowed_with: bool = True,
+    record_id: str = None,
+) -> Dict:
+    """
+    Test a single permission key.
+    Returns dict with test results.
+    """
+    result = {
+        "key": key,
+        "test_name": test_name,
+        "endpoint": endpoint,
+        "method": method,
+        "without_key_403": None,
+        "with_key_allowed": None,
+        "admin_allowed": None,
+        "pass": False,
+        "details": []
     }
     
-    log_info(f"POST {BASE_URL}/auth/login")
-    log_info(f"Payload: {json.dumps(payload, indent=2)}")
+    headers_user = {"Authorization": f"Bearer {user_token}"}
+    headers_admin = {"Authorization": f"Bearer {admin_token}"}
     
-    try:
-        response = requests.post(f"{BASE_URL}/auth/login", json=payload, timeout=10)
-        
-        log_info(f"Status: {response.status_code}")
-        
-        if response.status_code != 200:
-            log_error(f"Login failed with status {response.status_code}")
-            log_error(f"Response: {response.text}")
-            check_backend_logs()
-            return None
-        
-        data = response.json()
-        
-        if "token" not in data:
-            log_error("No token in response")
-            return None
-        
-        token = data["token"]
-        log_success(f"Login successful, token: {token[:20]}...")
-        
-        return token
-        
-    except Exception as e:
-        log_error(f"Login request failed: {e}")
-        check_backend_logs()
-        return None
-
-def test_flyover_crud(token: str):
-    """Test 2: Flyover CRUD endpoints"""
-    print("\n" + "="*70)
-    print("TEST 2: Flyover CRUD Endpoints")
-    print("="*70)
+    # Replace {id} placeholder if record_id provided
+    test_endpoint = endpoint.replace("{id}", record_id) if record_id else endpoint
     
-    headers = {"Authorization": f"Bearer {token}"}
-    all_passed = True
-    created_ids = []
-    
-    # Test 2.1: GET /api/flyovers (initial state)
-    print(f"\n{'-'*70}")
-    log_info("Test 2.1: GET /api/flyovers (initial state)")
-    print(f"{'-'*70}")
-    
-    try:
-        response = requests.get(f"{BASE_URL}/flyovers", headers=headers, timeout=10)
-        log_info(f"Status: {response.status_code}")
+    # Test 1: zzqa_user WITHOUT the key → should get 403
+    if expect_403_without:
+        # Set permissions to NAV_KEYS only (no action keys)
+        set_user_permissions(admin_token, ZZQA_USER_ID, NAV_KEYS)
         
-        if response.status_code == 200:
-            data = response.json()
-            log_success(f"GET /api/flyovers returned 200, found {len(data)} existing flyovers")
-            initial_count = len(data)
+        if method == "POST":
+            resp = requests.post(f"{API_BASE}{test_endpoint}", json=body or {}, headers=headers_user)
+        elif method == "PATCH" or method == "PUT":
+            resp = requests.patch(f"{API_BASE}{test_endpoint}", json=body or {}, headers=headers_user)
+        elif method == "DELETE":
+            resp = requests.delete(f"{API_BASE}{test_endpoint}", headers=headers_user)
         else:
-            log_error(f"GET /api/flyovers failed with status {response.status_code}")
-            all_passed = False
-            return all_passed, []
-    except Exception as e:
-        log_error(f"GET /api/flyovers failed: {e}")
-        all_passed = False
-        return all_passed, []
-    
-    # Test 2.2: POST /api/flyovers (create valid flyover)
-    print(f"\n{'-'*70}")
-    log_info("Test 2.2: POST /api/flyovers (create valid flyover)")
-    print(f"{'-'*70}")
-    
-    test_flyover = {
-        "lat": 30.9019,
-        "lng": 75.8543
-    }
-    
-    try:
-        log_info(f"POST {BASE_URL}/flyovers")
-        log_info(f"Payload: {json.dumps(test_flyover, indent=2)}")
+            resp = requests.get(f"{API_BASE}{test_endpoint}", headers=headers_user)
         
-        response = requests.post(f"{BASE_URL}/flyovers", json=test_flyover, headers=headers, timeout=10)
-        log_info(f"Status: {response.status_code}")
-        
-        if response.status_code == 200:
-            data = response.json()
-            log_info(f"Response: {json.dumps(data, indent=2)}")
-            
-            # Verify response structure
-            if "id" in data and "lat" in data and "lng" in data and "label" in data:
-                log_success(f"Flyover created successfully with id: {data['id']}")
-                
-                # Verify values
-                if abs(data["lat"] - test_flyover["lat"]) < 0.0001 and abs(data["lng"] - test_flyover["lng"]) < 0.0001:
-                    log_success("Coordinates match")
-                else:
-                    log_error(f"Coordinates mismatch: expected ({test_flyover['lat']}, {test_flyover['lng']}), got ({data['lat']}, {data['lng']})")
-                    all_passed = False
-                
-                if data["label"] == "Flyover":
-                    log_success("Default label 'Flyover' applied correctly")
-                else:
-                    log_warning(f"Label is '{data['label']}' instead of 'Flyover'")
-                
-                created_ids.append(data["id"])
-            else:
-                log_error("Response missing required fields (id, lat, lng, label)")
-                all_passed = False
+        result["without_key_403"] = resp.status_code == 403
+        if resp.status_code == 403:
+            result["details"].append(f"✓ Without key: 403 (correct)")
         else:
-            log_error(f"POST /api/flyovers failed with status {response.status_code}")
-            log_error(f"Response: {response.text}")
-            all_passed = False
-    except Exception as e:
-        log_error(f"POST /api/flyovers failed: {e}")
-        all_passed = False
+            result["details"].append(f"✗ Without key: {resp.status_code} (expected 403)")
+            if resp.status_code == 422:
+                result["details"].append(f"  ERROR: Got 422 validation before permission check!")
     
-    # Test 2.3: GET /api/flyovers (verify new flyover is present)
-    print(f"\n{'-'*70}")
-    log_info("Test 2.3: GET /api/flyovers (verify new flyover is present)")
-    print(f"{'-'*70}")
-    
-    try:
-        response = requests.get(f"{BASE_URL}/flyovers", headers=headers, timeout=10)
-        log_info(f"Status: {response.status_code}")
+    # Test 2: zzqa_user WITH the key → should be allowed (not 403)
+    if expect_allowed_with:
+        # Set permissions to NAV_KEYS + this specific key
+        set_user_permissions(admin_token, ZZQA_USER_ID, NAV_KEYS + [key])
         
-        if response.status_code == 200:
-            data = response.json()
-            log_success(f"GET /api/flyovers returned {len(data)} flyovers")
-            
-            if len(data) == initial_count + 1:
-                log_success(f"Flyover count increased from {initial_count} to {len(data)}")
-            else:
-                log_warning(f"Expected {initial_count + 1} flyovers, got {len(data)}")
-            
-            # Verify our flyover is in the list
-            if created_ids:
-                found = any(f.get("id") == created_ids[0] for f in data)
-                if found:
-                    log_success("New flyover found in list")
-                else:
-                    log_error("New flyover NOT found in list")
-                    all_passed = False
+        if method == "POST":
+            resp = requests.post(f"{API_BASE}{test_endpoint}", json=body or {}, headers=headers_user)
+        elif method == "PATCH" or method == "PUT":
+            resp = requests.patch(f"{API_BASE}{test_endpoint}", json=body or {}, headers=headers_user)
+        elif method == "DELETE":
+            resp = requests.delete(f"{API_BASE}{test_endpoint}", headers=headers_user)
         else:
-            log_error(f"GET /api/flyovers failed with status {response.status_code}")
-            all_passed = False
-    except Exception as e:
-        log_error(f"GET /api/flyovers failed: {e}")
-        all_passed = False
-    
-    # Test 2.4: POST /api/flyovers (invalid coordinates - should return 400)
-    print(f"\n{'-'*70}")
-    log_info("Test 2.4: POST /api/flyovers (invalid coordinates - should return 400)")
-    print(f"{'-'*70}")
-    
-    invalid_flyover = {
-        "lat": 200,  # Invalid latitude
-        "lng": 0
-    }
-    
-    try:
-        log_info(f"POST {BASE_URL}/flyovers")
-        log_info(f"Payload: {json.dumps(invalid_flyover, indent=2)}")
+            resp = requests.get(f"{API_BASE}{test_endpoint}", headers=headers_user)
         
-        response = requests.post(f"{BASE_URL}/flyovers", json=invalid_flyover, headers=headers, timeout=10)
-        log_info(f"Status: {response.status_code}")
-        
-        if response.status_code == 400:
-            log_success("Invalid coordinates correctly rejected with 400")
+        result["with_key_allowed"] = resp.status_code != 403
+        if resp.status_code != 403:
+            result["details"].append(f"✓ With key: {resp.status_code} (not 403, allowed)")
         else:
-            log_error(f"Expected 400 for invalid coordinates, got {response.status_code}")
-            all_passed = False
-    except Exception as e:
-        log_error(f"POST /api/flyovers with invalid coords failed: {e}")
-        all_passed = False
+            result["details"].append(f"✗ With key: 403 (should be allowed)")
     
-    # Test 2.5: DELETE /api/flyovers/{id}
-    print(f"\n{'-'*70}")
-    log_info("Test 2.5: DELETE /api/flyovers/{id}")
-    print(f"{'-'*70}")
-    
-    if created_ids:
-        try:
-            flyover_id = created_ids[0]
-            log_info(f"DELETE {BASE_URL}/flyovers/{flyover_id}")
-            
-            response = requests.delete(f"{BASE_URL}/flyovers/{flyover_id}", headers=headers, timeout=10)
-            log_info(f"Status: {response.status_code}")
-            
-            if response.status_code == 200:
-                data = response.json()
-                if data.get("ok") == True:
-                    log_success(f"Flyover {flyover_id} deleted successfully")
-                    created_ids.remove(flyover_id)
-                else:
-                    log_error(f"DELETE returned 200 but ok != true: {data}")
-                    all_passed = False
-            else:
-                log_error(f"DELETE /api/flyovers/{flyover_id} failed with status {response.status_code}")
-                all_passed = False
-        except Exception as e:
-            log_error(f"DELETE /api/flyovers failed: {e}")
-            all_passed = False
-    
-    # Test 2.6: GET /api/flyovers (verify flyover is gone)
-    print(f"\n{'-'*70}")
-    log_info("Test 2.6: GET /api/flyovers (verify flyover is gone)")
-    print(f"{'-'*70}")
-    
-    try:
-        response = requests.get(f"{BASE_URL}/flyovers", headers=headers, timeout=10)
-        log_info(f"Status: {response.status_code}")
-        
-        if response.status_code == 200:
-            data = response.json()
-            log_success(f"GET /api/flyovers returned {len(data)} flyovers")
-            
-            if len(data) == initial_count:
-                log_success(f"Flyover count back to initial {initial_count}")
-            else:
-                log_warning(f"Expected {initial_count} flyovers, got {len(data)}")
-        else:
-            log_error(f"GET /api/flyovers failed with status {response.status_code}")
-            all_passed = False
-    except Exception as e:
-        log_error(f"GET /api/flyovers failed: {e}")
-        all_passed = False
-    
-    return all_passed, created_ids
-
-def test_optimize_baseline(token: str):
-    """Test 3: Baseline optimize (before adding flyovers)"""
-    print("\n" + "="*70)
-    print("TEST 3: Baseline Optimize (Record C_before)")
-    print("="*70)
-    
-    headers = {"Authorization": f"Bearer {token}"}
-    
-    # Use the exact stops from the review request
-    payload = {
-        "stops": [
-            {"lat": 30.905, "lng": 75.862, "name": "Stop A"},
-            {"lat": 30.898, "lng": 75.858, "name": "Stop B"}
-        ]
-    }
-    
-    log_info(f"POST {BASE_URL}/transport/optimize")
-    log_info(f"Payload: {json.dumps(payload, indent=2)}")
-    
-    try:
-        response = requests.post(
-            f"{BASE_URL}/transport/optimize",
-            json=payload,
-            headers=headers,
-            timeout=60
-        )
-        
-        log_info(f"Status: {response.status_code}")
-        
-        if response.status_code != 200:
-            log_error(f"Optimize failed with status {response.status_code}")
-            log_error(f"Response: {response.text}")
-            check_backend_logs()
-            return None
-        
-        data = response.json()
-        
-        # Verify response structure
-        if "options" not in data:
-            log_error("No 'options' array in response")
-            return None
-        
-        options = data["options"]
-        log_success(f"Received {len(options)} route options")
-        
-        # Print detailed table
-        print(f"\n{'Label':<30} {'Distance (km)':<15} {'Crossings':<12} {'Order':<15} {'Geometry len':<15}")
-        print("-" * 87)
-        
-        avoid_option = None
-        shortest_option = None
-        
-        for opt in options:
-            label = opt.get("label", "Unknown")
-            distance = opt.get("total_distance_km")
-            crossings = opt.get("crossings")
-            order = opt.get("order", [])
-            geometry = opt.get("geometry", "")
-            
-            dist_str = f"{distance:.2f}" if distance is not None else "N/A"
-            cross_str = str(crossings) if crossings is not None else "null"
-            order_str = str(order)
-            geom_str = str(len(geometry))
-            
-            print(f"{label:<30} {dist_str:<15} {cross_str:<12} {order_str:<15} {geom_str:<15}")
-            
-            if label == "Avoid railway crossing":
-                avoid_option = opt
-            elif label == "Shortest (optimized)":
-                shortest_option = opt
-        
-        print("-" * 87)
-        
-        # Verify "Avoid railway crossing" option is present
-        if not avoid_option:
-            log_error("'Avoid railway crossing' option NOT present")
-            log_warning("This may indicate external services are unreachable")
-            return None
-        
-        log_success("'Avoid railway crossing' option is present")
-        
-        # Verify crossings field
-        if "crossings" not in avoid_option:
-            log_error("'Avoid railway crossing' option missing 'crossings' field")
-            return None
-        
-        c_before = avoid_option["crossings"]
-        
-        if c_before is None:
-            log_warning("'Avoid railway crossing' option has null crossings (external services may be unreachable)")
-            return None
-        
-        log_success(f"C_before (Avoid railway crossing crossings): {c_before}")
-        
-        # Also record shortest option crossings
-        if shortest_option and shortest_option.get("crossings") is not None:
-            log_info(f"Shortest option crossings: {shortest_option['crossings']}")
-        
-        return {
-            "c_before": c_before,
-            "avoid_option": avoid_option,
-            "shortest_option": shortest_option,
-            "all_options": options
-        }
-        
-    except Exception as e:
-        log_error(f"Optimize request failed: {e}")
-        check_backend_logs()
-        return None
-
-def test_optimize_with_flyovers(token: str, baseline_data: Dict):
-    """Test 4: KEY TEST - Create flyovers and verify crossings decrease"""
-    print("\n" + "="*70)
-    print("TEST 4: KEY TEST - User Flyovers Reduce Crossings")
-    print("="*70)
-    
-    headers = {"Authorization": f"Bearer {token}"}
-    created_flyover_ids = []
-    
-    c_before = baseline_data["c_before"]
-    log_info(f"Baseline crossings (C_before): {c_before}")
-    
-    # Create flyovers at the crossing points
-    # The review request mentions user-marked phataks around lat 30.902, lng 75.854
-    # We'll create flyovers at these strategic points to cover both legs' crossings
-    flyover_points = [
-        {"lat": 30.9040, "lng": 75.8548, "name": "Flyover 1"},
-        {"lat": 30.8990, "lng": 75.8555, "name": "Flyover 2"},
-        {"lat": 30.90191, "lng": 75.85429, "name": "Flyover 3"},
-        {"lat": 30.89965, "lng": 75.85309, "name": "Flyover 4"}
-    ]
-    
-    print(f"\n{'-'*70}")
-    log_info("Step 1: Creating flyovers at crossing points")
-    print(f"{'-'*70}")
-    
-    for i, point in enumerate(flyover_points):
-        try:
-            payload = {"lat": point["lat"], "lng": point["lng"]}
-            log_info(f"Creating flyover {i+1}/4 at ({point['lat']}, {point['lng']})")
-            
-            response = requests.post(f"{BASE_URL}/flyovers", json=payload, headers=headers, timeout=10)
-            
-            if response.status_code == 200:
-                data = response.json()
-                created_flyover_ids.append(data["id"])
-                log_success(f"Flyover {i+1} created with id: {data['id']}")
-            else:
-                log_error(f"Failed to create flyover {i+1}: status {response.status_code}")
-                log_error(f"Response: {response.text}")
-        except Exception as e:
-            log_error(f"Failed to create flyover {i+1}: {e}")
-    
-    if len(created_flyover_ids) != len(flyover_points):
-        log_error(f"Only created {len(created_flyover_ids)}/{len(flyover_points)} flyovers")
+    # Test 3: zzqa_admin can do it
+    if method == "POST":
+        resp = requests.post(f"{API_BASE}{test_endpoint}", json=body or {}, headers=headers_admin)
+    elif method == "PATCH" or method == "PUT":
+        resp = requests.patch(f"{API_BASE}{test_endpoint}", json=body or {}, headers=headers_admin)
+    elif method == "DELETE":
+        resp = requests.delete(f"{API_BASE}{test_endpoint}", headers=headers_admin)
     else:
-        log_success(f"All {len(flyover_points)} flyovers created successfully")
+        resp = requests.get(f"{API_BASE}{test_endpoint}", headers=headers_admin)
     
-    # Now call optimize again with the SAME stops
-    print(f"\n{'-'*70}")
-    log_info("Step 2: Calling optimize with same stops (after adding flyovers)")
-    print(f"{'-'*70}")
+    result["admin_allowed"] = resp.status_code != 403
+    if resp.status_code != 403:
+        result["details"].append(f"✓ Admin: {resp.status_code} (allowed)")
+    else:
+        result["details"].append(f"✗ Admin: 403 (should be allowed)")
     
-    payload = {
-        "stops": [
-            {"lat": 30.905, "lng": 75.862, "name": "Stop A"},
-            {"lat": 30.898, "lng": 75.858, "name": "Stop B"}
-        ]
-    }
+    # Overall pass/fail
+    result["pass"] = (
+        (not expect_403_without or result["without_key_403"]) and
+        (not expect_allowed_with or result["with_key_allowed"]) and
+        result["admin_allowed"]
+    )
     
-    log_info(f"POST {BASE_URL}/transport/optimize")
-    
-    try:
-        response = requests.post(
-            f"{BASE_URL}/transport/optimize",
-            json=payload,
-            headers=headers,
-            timeout=60
-        )
-        
-        log_info(f"Status: {response.status_code}")
-        
-        if response.status_code != 200:
-            log_error(f"Optimize failed with status {response.status_code}")
-            log_error(f"Response: {response.text}")
-            check_backend_logs()
-            return False, created_flyover_ids
-        
-        data = response.json()
-        
-        if "options" not in data:
-            log_error("No 'options' array in response")
-            return False, created_flyover_ids
-        
-        options = data["options"]
-        log_success(f"Received {len(options)} route options")
-        
-        # Print detailed table
-        print(f"\n{'Label':<30} {'Distance (km)':<15} {'Crossings':<12} {'Order':<15} {'Geometry len':<15}")
-        print("-" * 87)
-        
-        avoid_option = None
-        
-        for opt in options:
-            label = opt.get("label", "Unknown")
-            distance = opt.get("total_distance_km")
-            crossings = opt.get("crossings")
-            order = opt.get("order", [])
-            geometry = opt.get("geometry", "")
-            
-            dist_str = f"{distance:.2f}" if distance is not None else "N/A"
-            cross_str = str(crossings) if crossings is not None else "null"
-            order_str = str(order)
-            geom_str = str(len(geometry))
-            
-            print(f"{label:<30} {dist_str:<15} {cross_str:<12} {order_str:<15} {geom_str:<15}")
-            
-            if label == "Avoid railway crossing":
-                avoid_option = opt
-        
-        print("-" * 87)
-        
-        # Verify "Avoid railway crossing" option is present
-        if not avoid_option:
-            log_error("'Avoid railway crossing' option NOT present after adding flyovers")
-            return False, created_flyover_ids
-        
-        log_success("'Avoid railway crossing' option is present")
-        
-        # Get C_after
-        c_after = avoid_option.get("crossings")
-        
-        if c_after is None:
-            log_error("'Avoid railway crossing' option has null crossings")
-            return False, created_flyover_ids
-        
-        log_success(f"C_after (Avoid railway crossing crossings): {c_after}")
-        
-        # THE KEY VERIFICATION: C_after < C_before
-        print(f"\n{'-'*70}")
-        log_info("Step 3: Verifying crossings reduction")
-        print(f"{'-'*70}")
-        
-        log_info(f"C_before: {c_before}")
-        log_info(f"C_after:  {c_after}")
-        log_info(f"Reduction: {c_before - c_after}")
-        
-        if c_after < c_before:
-            log_success(f"✓✓ PASS: C_after ({c_after}) < C_before ({c_before})")
-            log_success(f"User-marked flyovers successfully reduced crossings by {c_before - c_after}")
-            return True, created_flyover_ids
-        elif c_after == c_before:
-            log_error(f"✗✗ FAIL: C_after ({c_after}) == C_before ({c_before})")
-            log_error("User-marked flyovers did NOT reduce crossings")
-            log_error("The flyovers are not being honored by the avoidance route")
-            return False, created_flyover_ids
-        else:
-            log_error(f"✗✗ FAIL: C_after ({c_after}) > C_before ({c_before})")
-            log_error("Crossings INCREASED after adding flyovers (unexpected)")
-            return False, created_flyover_ids
-        
-    except Exception as e:
-        log_error(f"Optimize request failed: {e}")
-        check_backend_logs()
-        return False, created_flyover_ids
+    return result
 
-def cleanup_flyovers(token: str, flyover_ids: List[str]):
-    """Cleanup: Delete all test flyovers"""
-    print("\n" + "="*70)
-    print("CLEANUP: Deleting Test Flyovers")
-    print("="*70)
-    
+
+def create_zzqa_customer(token: str) -> Optional[str]:
+    """Create a ZZQA test customer and return its ID"""
     headers = {"Authorization": f"Bearer {token}"}
+    body = {
+        "name": "ZZQA Test Customer",
+        "phone": "9999999999",
+        "address": "ZZQA Test Address",
+        "city": "ZZQA City",
+        "state": "Punjab"
+    }
+    resp = requests.post(f"{API_BASE}/customers", json=body, headers=headers)
+    if resp.status_code in [200, 201]:
+        cust = resp.json()
+        cid = cust.get("id")
+        if cid:
+            created_records["customers"].append(cid)
+            return cid
+    return None
+
+
+def create_zzqa_product(token: str) -> Optional[str]:
+    """Create a ZZQA test product and return its ID"""
+    headers = {"Authorization": f"Bearer {token}"}
+    body = {
+        "name": "ZZQA Test Product",
+        "category": "Test",
+        "unit": "pcs"
+    }
+    resp = requests.post(f"{API_BASE}/products", json=body, headers=headers)
+    if resp.status_code in [200, 201]:
+        prod = resp.json()
+        pid = prod.get("id")
+        if pid:
+            created_records["products"].append(pid)
+            return pid
+    return None
+
+
+def create_zzqa_raw_material(token: str) -> Optional[str]:
+    """Create a ZZQA test raw material and return its ID"""
+    headers = {"Authorization": f"Bearer {token}"}
+    body = {
+        "name": "ZZQA Test Raw Material",
+        "unit": "kg"
+    }
+    resp = requests.post(f"{API_BASE}/raw-materials", json=body, headers=headers)
+    if resp.status_code in [200, 201]:
+        rm = resp.json()
+        rid = rm.get("id")
+        if rid:
+            created_records["rawMaterials"].append(rid)
+            return rid
+    return None
+
+
+def create_zzqa_supplier(token: str) -> Optional[str]:
+    """Create a ZZQA test supplier and return its ID"""
+    headers = {"Authorization": f"Bearer {token}"}
+    body = {
+        "name": "ZZQA Test Supplier",
+        "phone": "9999999999",
+        "address": "ZZQA Supplier Address"
+    }
+    resp = requests.post(f"{API_BASE}/suppliers", json=body, headers=headers)
+    if resp.status_code in [200, 201]:
+        sup = resp.json()
+        sid = sup.get("id")
+        if sid:
+            created_records["suppliers"].append(sid)
+            return sid
+    return None
+
+
+def create_zzqa_price_list(token: str) -> Optional[str]:
+    """Create a ZZQA test price list and return its ID"""
+    headers = {"Authorization": f"Bearer {token}"}
+    body = {
+        "name": "ZZQA Test Price List",
+        "effective_date": "2026-01-01"
+    }
+    resp = requests.post(f"{API_BASE}/price-lists", json=body, headers=headers)
+    if resp.status_code in [200, 201]:
+        pl = resp.json()
+        plid = pl.get("id")
+        if plid:
+            created_records["priceLists"].append(plid)
+            return plid
+    return None
+
+
+def create_zzqa_vendor_price_list(token: str, supplier_id: str) -> Optional[str]:
+    """Create a ZZQA test vendor price list and return its ID"""
+    headers = {"Authorization": f"Bearer {token}"}
+    body = {
+        "supplier_id": supplier_id,
+        "name": "ZZQA Test Vendor Price List",
+        "effective_date": "2026-01-01"
+    }
+    resp = requests.post(f"{API_BASE}/vendor-price-lists", json=body, headers=headers)
+    if resp.status_code in [200, 201]:
+        vpl = resp.json()
+        vplid = vpl.get("id")
+        if vplid:
+            created_records["vendorPriceLists"].append(vplid)
+            return vplid
+    return None
+
+
+def cleanup_all_zzqa_records(admin_token: str):
+    """Delete all ZZQA test records created during testing"""
+    headers = {"Authorization": f"Bearer {admin_token}"}
+    print("\n" + "="*80)
+    print("CLEANUP: Deleting all ZZQA test records...")
+    print("="*80)
     
-    if not flyover_ids:
-        log_info("No flyovers to clean up")
-        return True
+    # Delete in reverse dependency order
+    for pid in created_records["payments"]:
+        requests.delete(f"{API_BASE}/payments/{pid}", headers=headers)
+        print(f"  Deleted payment: {pid}")
     
-    log_info(f"Deleting {len(flyover_ids)} test flyovers...")
+    for srid in created_records["saleReturns"]:
+        requests.delete(f"{API_BASE}/sale-returns/{srid}", headers=headers)
+        print(f"  Deleted sale return: {srid}")
     
-    all_deleted = True
-    for i, flyover_id in enumerate(flyover_ids):
-        try:
-            log_info(f"Deleting flyover {i+1}/{len(flyover_ids)}: {flyover_id}")
-            response = requests.delete(f"{BASE_URL}/flyovers/{flyover_id}", headers=headers, timeout=10)
-            
-            if response.status_code == 200:
-                log_success(f"Flyover {flyover_id} deleted")
-            else:
-                log_error(f"Failed to delete flyover {flyover_id}: status {response.status_code}")
-                all_deleted = False
-        except Exception as e:
-            log_error(f"Failed to delete flyover {flyover_id}: {e}")
-            all_deleted = False
+    for spid in created_records["supplierPayments"]:
+        requests.delete(f"{API_BASE}/supplier-payments/{spid}", headers=headers)
+        print(f"  Deleted supplier payment: {spid}")
     
-    # Verify all flyovers are gone
-    try:
-        response = requests.get(f"{BASE_URL}/flyovers", headers=headers, timeout=10)
-        if response.status_code == 200:
-            data = response.json()
-            remaining_test_flyovers = [f for f in data if f.get("id") in flyover_ids]
-            
-            if not remaining_test_flyovers:
-                log_success("All test flyovers successfully removed")
-            else:
-                log_error(f"{len(remaining_test_flyovers)} test flyovers still present")
-                all_deleted = False
-    except Exception as e:
-        log_warning(f"Could not verify cleanup: {e}")
+    for prid in created_records["purchaseReturns"]:
+        requests.delete(f"{API_BASE}/purchase-returns/{prid}", headers=headers)
+        print(f"  Deleted purchase return: {prid}")
     
-    return all_deleted
+    for spid in created_records["supplierPurchases"]:
+        requests.delete(f"{API_BASE}/supplier-purchases/{spid}", headers=headers)
+        print(f"  Deleted supplier purchase: {spid}")
+    
+    for did in created_records["dispatches"]:
+        requests.delete(f"{API_BASE}/dispatches/{did}", headers=headers)
+        print(f"  Deleted dispatch: {did}")
+    
+    for oid in created_records["orders"]:
+        requests.delete(f"{API_BASE}/orders/{oid}", headers=headers)
+        print(f"  Deleted order: {oid}")
+    
+    for vplid in created_records["vendorPriceLists"]:
+        requests.delete(f"{API_BASE}/vendor-price-lists/{vplid}", headers=headers)
+        print(f"  Deleted vendor price list: {vplid}")
+    
+    for plid in created_records["priceLists"]:
+        requests.delete(f"{API_BASE}/price-lists/{plid}", headers=headers)
+        print(f"  Deleted price list: {plid}")
+    
+    for iid in created_records["items"]:
+        requests.delete(f"{API_BASE}/items/{iid}", headers=headers)
+        print(f"  Deleted item: {iid}")
+    
+    for pid in created_records["products"]:
+        requests.delete(f"{API_BASE}/products/{pid}", headers=headers)
+        print(f"  Deleted product: {pid}")
+    
+    for rid in created_records["rawMaterials"]:
+        requests.delete(f"{API_BASE}/raw-materials/{rid}", headers=headers)
+        print(f"  Deleted raw material: {rid}")
+    
+    for sid in created_records["suppliers"]:
+        requests.delete(f"{API_BASE}/suppliers/{sid}", headers=headers)
+        print(f"  Deleted supplier: {sid}")
+    
+    for cid in created_records["customers"]:
+        requests.delete(f"{API_BASE}/customers/{cid}", headers=headers)
+        print(f"  Deleted customer: {cid}")
+    
+    print("✓ Cleanup complete")
+    
+    # Reset zzqa_user permissions to just nav keys
+    print("\nResetting zzqa_user permissions to nav keys only...")
+    set_user_permissions(admin_token, ZZQA_USER_ID, NAV_KEYS)
+    print("✓ zzqa_user permissions reset")
+
 
 def main():
-    print("\n" + "="*70)
-    print("FACTORY ERP - RAILWAY CROSSING AVOIDANCE + FLYOVER CRUD TEST")
-    print("="*70)
-    print(f"Backend URL: {BASE_URL}")
-    print("="*70)
+    print("="*80)
+    print("PERMISSION SYSTEM TEST - 30 Action Keys (10 Modules × 3 Actions)")
+    print("="*80)
     
-    results = {
-        "passed": 0,
-        "failed": 0,
-        "critical_failure": False
-    }
+    # Login
+    print("\n1. Logging in...")
+    admin_token = login(ZZQA_ADMIN)
+    user_token = login(ZZQA_USER)
+    print(f"  ✓ zzqa_admin logged in")
+    print(f"  ✓ zzqa_user logged in")
     
-    # Test 0: Health check
-    print("\n")
-    if test_health_endpoint():
-        results["passed"] += 1
+    # Test permissions catalog endpoint
+    print("\n2. Testing GET /api/permissions/catalog...")
+    headers_admin = {"Authorization": f"Bearer {admin_token}"}
+    resp = requests.get(f"{API_BASE}/permissions/catalog", headers=headers_admin)
+    if resp.status_code == 200:
+        catalog = resp.json()
+        actions = catalog.get("actions", [])
+        print(f"  ✓ Catalog returned {len(actions)} action keys")
+        if len(actions) == 30:
+            print(f"  ✓ All 30 action keys present")
+        else:
+            print(f"  ✗ Expected 30 action keys, got {len(actions)}")
     else:
-        results["failed"] += 1
-        log_warning("Health check failed but continuing with tests...")
+        print(f"  ✗ Failed: {resp.status_code}")
     
-    # Test 1: Admin login
-    token = test_admin_login()
-    if not token:
-        results["failed"] += 1
-        results["critical_failure"] = True
-        log_error("Cannot continue without auth token")
-        print_summary(results)
-        return
-    
-    results["passed"] += 1
-    
-    # Test 2: Flyover CRUD
-    crud_passed, leftover_ids = test_flyover_crud(token)
-    if crud_passed:
-        results["passed"] += 1
+    # Test PATCH permissions endpoint with valid keys
+    print("\n3. Testing PATCH /api/users/{uid}/permissions with all 30 keys...")
+    all_perms = NAV_KEYS + ALL_ACTION_KEYS
+    resp = requests.patch(
+        f"{API_BASE}/users/{ZZQA_USER_ID}/permissions",
+        json={"permissions": all_perms},
+        headers=headers_admin
+    )
+    if resp.status_code == 200:
+        print(f"  ✓ Accepted all 30 action keys + nav keys")
     else:
-        results["failed"] += 1
+        print(f"  ✗ Failed: {resp.status_code} {resp.text}")
     
-    # Clean up any leftover flyovers from CRUD test
-    if leftover_ids:
-        cleanup_flyovers(token, leftover_ids)
-    
-    # Test 3: Baseline optimize (record C_before)
-    baseline_data = test_optimize_baseline(token)
-    if baseline_data:
-        results["passed"] += 1
+    # Test PATCH permissions endpoint with invalid key
+    print("\n4. Testing PATCH /api/users/{uid}/permissions with invalid key...")
+    invalid_perms = NAV_KEYS + ["invalid:key"]
+    resp = requests.patch(
+        f"{API_BASE}/users/{ZZQA_USER_ID}/permissions",
+        json={"permissions": invalid_perms},
+        headers=headers_admin
+    )
+    if resp.status_code == 400:
+        print(f"  ✓ Correctly rejected invalid key with 400")
     else:
-        results["failed"] += 1
-        results["critical_failure"] = True
-        log_error("Cannot continue without baseline data")
-        print_summary(results)
-        return
+        print(f"  ✗ Expected 400, got {resp.status_code}")
     
-    # Test 4: KEY TEST - Optimize with flyovers (verify C_after < C_before)
-    key_test_passed, flyover_ids = test_optimize_with_flyovers(token, baseline_data)
-    if key_test_passed:
-        results["passed"] += 1
-        log_success("✓✓ KEY TEST PASSED: User flyovers reduce crossings")
+    # Create test records for edit/delete operations
+    print("\n5. Creating test records for edit/delete operations...")
+    cust_id = create_zzqa_customer(admin_token)
+    prod_id = create_zzqa_product(admin_token)
+    rm_id = create_zzqa_raw_material(admin_token)
+    supp_id = create_zzqa_supplier(admin_token)
+    pl_id = create_zzqa_price_list(admin_token)
+    vpl_id = create_zzqa_vendor_price_list(admin_token, supp_id) if supp_id else None
+    
+    print(f"  ✓ Created customer: {cust_id}")
+    print(f"  ✓ Created product: {prod_id}")
+    print(f"  ✓ Created raw material: {rm_id}")
+    print(f"  ✓ Created supplier: {supp_id}")
+    print(f"  ✓ Created price list: {pl_id}")
+    print(f"  ✓ Created vendor price list: {vpl_id}")
+    
+    # Test all 30 permission keys
+    print("\n6. Testing all 30 permission keys...")
+    print("="*80)
+    
+    # CUSTOMERS (3 keys)
+    print("\n--- CUSTOMERS ---")
+    result = test_permission_key(
+        "add:customers", "/customers", "POST",
+        body={"name": "ZZQA Test", "phone": "9999999999", "address": "Test", "city": "Test", "state": "Test"},
+        user_token=user_token, admin_token=admin_token,
+        test_name="Create customer"
+    )
+    test_results.append(result)
+    print(f"  {result['key']}: {'PASS' if result['pass'] else 'FAIL'}")
+    for detail in result['details']:
+        print(f"    {detail}")
+    
+    result = test_permission_key(
+        "edit:customers", f"/customers/{cust_id}", "PATCH",
+        body={"name": "ZZQA Updated"},
+        user_token=user_token, admin_token=admin_token,
+        test_name="Update customer", record_id=cust_id
+    )
+    test_results.append(result)
+    print(f"  {result['key']}: {'PASS' if result['pass'] else 'FAIL'}")
+    for detail in result['details']:
+        print(f"    {detail}")
+    
+    # For delete, we'll test with a non-existent ID to avoid actually deleting
+    result = test_permission_key(
+        "delete:customers", "/customers/nonexistent-id", "DELETE",
+        user_token=user_token, admin_token=admin_token,
+        test_name="Delete customer"
+    )
+    test_results.append(result)
+    print(f"  {result['key']}: {'PASS' if result['pass'] else 'FAIL'}")
+    for detail in result['details']:
+        print(f"    {detail}")
+    
+    # PRODUCTS (3 keys)
+    print("\n--- PRODUCTS ---")
+    result = test_permission_key(
+        "add:products", "/products", "POST",
+        body={"name": "ZZQA Product", "category": "Test", "unit": "pcs"},
+        user_token=user_token, admin_token=admin_token,
+        test_name="Create product"
+    )
+    test_results.append(result)
+    print(f"  {result['key']}: {'PASS' if result['pass'] else 'FAIL'}")
+    for detail in result['details']:
+        print(f"    {detail}")
+    
+    result = test_permission_key(
+        "edit:products", f"/products/{prod_id}", "PATCH",
+        body={"name": "ZZQA Updated Product"},
+        user_token=user_token, admin_token=admin_token,
+        test_name="Update product", record_id=prod_id
+    )
+    test_results.append(result)
+    print(f"  {result['key']}: {'PASS' if result['pass'] else 'FAIL'}")
+    for detail in result['details']:
+        print(f"    {detail}")
+    
+    result = test_permission_key(
+        "delete:products", "/products/nonexistent-id", "DELETE",
+        user_token=user_token, admin_token=admin_token,
+        test_name="Delete product"
+    )
+    test_results.append(result)
+    print(f"  {result['key']}: {'PASS' if result['pass'] else 'FAIL'}")
+    for detail in result['details']:
+        print(f"    {detail}")
+    
+    # RAW MATERIALS (3 keys)
+    print("\n--- RAW MATERIALS ---")
+    result = test_permission_key(
+        "add:rawMaterials", "/raw-materials", "POST",
+        body={"name": "ZZQA Raw Material", "unit": "kg"},
+        user_token=user_token, admin_token=admin_token,
+        test_name="Create raw material"
+    )
+    test_results.append(result)
+    print(f"  {result['key']}: {'PASS' if result['pass'] else 'FAIL'}")
+    for detail in result['details']:
+        print(f"    {detail}")
+    
+    result = test_permission_key(
+        "edit:rawMaterials", f"/raw-materials/{rm_id}", "PATCH",
+        body={"name": "ZZQA Updated RM"},
+        user_token=user_token, admin_token=admin_token,
+        test_name="Update raw material", record_id=rm_id
+    )
+    test_results.append(result)
+    print(f"  {result['key']}: {'PASS' if result['pass'] else 'FAIL'}")
+    for detail in result['details']:
+        print(f"    {detail}")
+    
+    result = test_permission_key(
+        "delete:rawMaterials", "/raw-materials/nonexistent-id", "DELETE",
+        user_token=user_token, admin_token=admin_token,
+        test_name="Delete raw material"
+    )
+    test_results.append(result)
+    print(f"  {result['key']}: {'PASS' if result['pass'] else 'FAIL'}")
+    for detail in result['details']:
+        print(f"    {detail}")
+    
+    # SUPPLIERS (3 keys)
+    print("\n--- SUPPLIERS ---")
+    result = test_permission_key(
+        "add:suppliers", "/suppliers", "POST",
+        body={"name": "ZZQA Supplier", "phone": "9999999999", "address": "Test"},
+        user_token=user_token, admin_token=admin_token,
+        test_name="Create supplier"
+    )
+    test_results.append(result)
+    print(f"  {result['key']}: {'PASS' if result['pass'] else 'FAIL'}")
+    for detail in result['details']:
+        print(f"    {detail}")
+    
+    result = test_permission_key(
+        "edit:suppliers", f"/suppliers/{supp_id}", "PATCH",
+        body={"name": "ZZQA Updated Supplier"},
+        user_token=user_token, admin_token=admin_token,
+        test_name="Update supplier", record_id=supp_id
+    )
+    test_results.append(result)
+    print(f"  {result['key']}: {'PASS' if result['pass'] else 'FAIL'}")
+    for detail in result['details']:
+        print(f"    {detail}")
+    
+    result = test_permission_key(
+        "delete:suppliers", "/suppliers/nonexistent-id", "DELETE",
+        user_token=user_token, admin_token=admin_token,
+        test_name="Delete supplier"
+    )
+    test_results.append(result)
+    print(f"  {result['key']}: {'PASS' if result['pass'] else 'FAIL'}")
+    for detail in result['details']:
+        print(f"    {detail}")
+    
+    # PRICE LISTS (3 keys)
+    print("\n--- PRICE LISTS ---")
+    result = test_permission_key(
+        "add:priceLists", "/price-lists", "POST",
+        body={"name": "ZZQA Price List", "effective_date": "2026-01-01"},
+        user_token=user_token, admin_token=admin_token,
+        test_name="Create price list"
+    )
+    test_results.append(result)
+    print(f"  {result['key']}: {'PASS' if result['pass'] else 'FAIL'}")
+    for detail in result['details']:
+        print(f"    {detail}")
+    
+    result = test_permission_key(
+        "edit:priceLists", f"/price-lists/{pl_id}", "PATCH",
+        body={"name": "ZZQA Updated PL"},
+        user_token=user_token, admin_token=admin_token,
+        test_name="Update price list", record_id=pl_id
+    )
+    test_results.append(result)
+    print(f"  {result['key']}: {'PASS' if result['pass'] else 'FAIL'}")
+    for detail in result['details']:
+        print(f"    {detail}")
+    
+    result = test_permission_key(
+        "delete:priceLists", "/price-lists/nonexistent-id", "DELETE",
+        user_token=user_token, admin_token=admin_token,
+        test_name="Delete price list"
+    )
+    test_results.append(result)
+    print(f"  {result['key']}: {'PASS' if result['pass'] else 'FAIL'}")
+    for detail in result['details']:
+        print(f"    {detail}")
+    
+    # VENDOR PRICE LISTS (3 keys)
+    print("\n--- VENDOR PRICE LISTS ---")
+    result = test_permission_key(
+        "add:vendorPriceLists", "/vendor-price-lists", "POST",
+        body={"supplier_id": supp_id, "name": "ZZQA VPL", "effective_date": "2026-01-01"},
+        user_token=user_token, admin_token=admin_token,
+        test_name="Create vendor price list"
+    )
+    test_results.append(result)
+    print(f"  {result['key']}: {'PASS' if result['pass'] else 'FAIL'}")
+    for detail in result['details']:
+        print(f"    {detail}")
+    
+    result = test_permission_key(
+        "edit:vendorPriceLists", f"/vendor-price-lists/{vpl_id}", "PATCH",
+        body={"name": "ZZQA Updated VPL"},
+        user_token=user_token, admin_token=admin_token,
+        test_name="Update vendor price list", record_id=vpl_id
+    )
+    test_results.append(result)
+    print(f"  {result['key']}: {'PASS' if result['pass'] else 'FAIL'}")
+    for detail in result['details']:
+        print(f"    {detail}")
+    
+    result = test_permission_key(
+        "delete:vendorPriceLists", "/vendor-price-lists/nonexistent-id", "DELETE",
+        user_token=user_token, admin_token=admin_token,
+        test_name="Delete vendor price list"
+    )
+    test_results.append(result)
+    print(f"  {result['key']}: {'PASS' if result['pass'] else 'FAIL'}")
+    for detail in result['details']:
+        print(f"    {detail}")
+    
+    # ORDERS (3 keys)
+    print("\n--- ORDERS ---")
+    result = test_permission_key(
+        "add:orders", "/orders", "POST",
+        body={"customer_id": cust_id, "items": []},
+        user_token=user_token, admin_token=admin_token,
+        test_name="Create order"
+    )
+    test_results.append(result)
+    print(f"  {result['key']}: {'PASS' if result['pass'] else 'FAIL'}")
+    for detail in result['details']:
+        print(f"    {detail}")
+    
+    result = test_permission_key(
+        "edit:orders", "/orders/nonexistent-id/status", "PATCH",
+        body={"status": "confirmed"},
+        user_token=user_token, admin_token=admin_token,
+        test_name="Update order status"
+    )
+    test_results.append(result)
+    print(f"  {result['key']}: {'PASS' if result['pass'] else 'FAIL'}")
+    for detail in result['details']:
+        print(f"    {detail}")
+    
+    result = test_permission_key(
+        "delete:orders", "/orders/nonexistent-id", "DELETE",
+        user_token=user_token, admin_token=admin_token,
+        test_name="Delete order"
+    )
+    test_results.append(result)
+    print(f"  {result['key']}: {'PASS' if result['pass'] else 'FAIL'}")
+    for detail in result['details']:
+        print(f"    {detail}")
+    
+    # DISPATCH (3 keys)
+    print("\n--- DISPATCH ---")
+    result = test_permission_key(
+        "add:dispatch", "/dispatch/execute", "POST",
+        body={"order_id": "nonexistent", "items": []},
+        user_token=user_token, admin_token=admin_token,
+        test_name="Create dispatch"
+    )
+    test_results.append(result)
+    print(f"  {result['key']}: {'PASS' if result['pass'] else 'FAIL'}")
+    for detail in result['details']:
+        print(f"    {detail}")
+    
+    result = test_permission_key(
+        "edit:dispatch", "/dispatches/nonexistent-id", "PATCH",
+        body={"notes": "Updated"},
+        user_token=user_token, admin_token=admin_token,
+        test_name="Update dispatch"
+    )
+    test_results.append(result)
+    print(f"  {result['key']}: {'PASS' if result['pass'] else 'FAIL'}")
+    for detail in result['details']:
+        print(f"    {detail}")
+    
+    result = test_permission_key(
+        "delete:dispatch", "/dispatches/nonexistent-id", "DELETE",
+        user_token=user_token, admin_token=admin_token,
+        test_name="Delete dispatch"
+    )
+    test_results.append(result)
+    print(f"  {result['key']}: {'PASS' if result['pass'] else 'FAIL'}")
+    for detail in result['details']:
+        print(f"    {detail}")
+    
+    # CUSTOMER LEDGER (3 keys)
+    print("\n--- CUSTOMER LEDGER ---")
+    result = test_permission_key(
+        "add:customerLedger", "/payments", "POST",
+        body={"customer_id": cust_id, "amount": 100, "payment_date": "2026-01-01"},
+        user_token=user_token, admin_token=admin_token,
+        test_name="Create payment"
+    )
+    test_results.append(result)
+    print(f"  {result['key']}: {'PASS' if result['pass'] else 'FAIL'}")
+    for detail in result['details']:
+        print(f"    {detail}")
+    
+    result = test_permission_key(
+        "edit:customerLedger", "/payments/nonexistent-id", "PATCH",
+        body={"amount": 200},
+        user_token=user_token, admin_token=admin_token,
+        test_name="Update payment"
+    )
+    test_results.append(result)
+    print(f"  {result['key']}: {'PASS' if result['pass'] else 'FAIL'}")
+    for detail in result['details']:
+        print(f"    {detail}")
+    
+    result = test_permission_key(
+        "delete:customerLedger", "/payments/nonexistent-id", "DELETE",
+        user_token=user_token, admin_token=admin_token,
+        test_name="Delete payment"
+    )
+    test_results.append(result)
+    print(f"  {result['key']}: {'PASS' if result['pass'] else 'FAIL'}")
+    for detail in result['details']:
+        print(f"    {detail}")
+    
+    # VENDOR LEDGER (3 keys)
+    print("\n--- VENDOR LEDGER ---")
+    result = test_permission_key(
+        "add:vendorLedger", "/supplier-purchases", "POST",
+        body={"supplier_id": supp_id, "items": [], "purchase_date": "2026-01-01"},
+        user_token=user_token, admin_token=admin_token,
+        test_name="Create supplier purchase"
+    )
+    test_results.append(result)
+    print(f"  {result['key']}: {'PASS' if result['pass'] else 'FAIL'}")
+    for detail in result['details']:
+        print(f"    {detail}")
+    
+    result = test_permission_key(
+        "edit:vendorLedger", "/supplier-purchases/nonexistent-id", "PATCH",
+        body={"notes": "Updated"},
+        user_token=user_token, admin_token=admin_token,
+        test_name="Update supplier purchase"
+    )
+    test_results.append(result)
+    print(f"  {result['key']}: {'PASS' if result['pass'] else 'FAIL'}")
+    for detail in result['details']:
+        print(f"    {detail}")
+    
+    result = test_permission_key(
+        "delete:vendorLedger", "/supplier-purchases/nonexistent-id", "DELETE",
+        user_token=user_token, admin_token=admin_token,
+        test_name="Delete supplier purchase"
+    )
+    test_results.append(result)
+    print(f"  {result['key']}: {'PASS' if result['pass'] else 'FAIL'}")
+    for detail in result['details']:
+        print(f"    {detail}")
+    
+    # Test key independence
+    print("\n7. Testing key independence (add doesn't grant edit/delete)...")
+    print("="*80)
+    
+    # Grant only add:customers
+    set_user_permissions(admin_token, ZZQA_USER_ID, NAV_KEYS + ["add:customers"])
+    headers_user = {"Authorization": f"Bearer {user_token}"}
+    
+    # Try to edit (should fail with 403)
+    resp = requests.patch(
+        f"{API_BASE}/customers/{cust_id}",
+        json={"name": "Should Fail"},
+        headers=headers_user
+    )
+    if resp.status_code == 403:
+        print("  ✓ add:customers does NOT grant edit:customers (403)")
     else:
-        results["failed"] += 1
-        log_error("✗✗ KEY TEST FAILED: User flyovers did NOT reduce crossings")
+        print(f"  ✗ add:customers should NOT grant edit:customers (got {resp.status_code})")
     
-    # Cleanup: Delete all test flyovers
-    cleanup_success = cleanup_flyovers(token, flyover_ids)
-    if cleanup_success:
-        results["passed"] += 1
+    # Try to delete (should fail with 403)
+    resp = requests.delete(f"{API_BASE}/customers/nonexistent-id", headers=headers_user)
+    if resp.status_code == 403:
+        print("  ✓ add:customers does NOT grant delete:customers (403)")
     else:
-        results["failed"] += 1
-        log_warning("Cleanup incomplete - some test flyovers may remain")
+        print(f"  ✗ add:customers should NOT grant delete:customers (got {resp.status_code})")
     
-    # Check backend logs for errors
-    print("\n" + "="*70)
-    print("STABILITY CHECK: Backend Logs")
-    print("="*70)
+    # Cleanup
+    cleanup_all_zzqa_records(admin_token)
     
-    logs = check_backend_logs()
-    if logs:
-        log_warning("Found errors/exceptions in backend logs (see above)")
-        results["failed"] += 1
-    else:
-        log_success("No critical errors found in backend logs")
-        results["passed"] += 1
-    
-    print_summary(results, key_test_passed)
-
-def print_summary(results: Dict[str, int], key_test_passed: bool = False):
-    print("\n" + "="*70)
+    # Summary
+    print("\n" + "="*80)
     print("TEST SUMMARY")
-    print("="*70)
-    print(f"Passed: {Colors.GREEN}{results['passed']}{Colors.END}")
-    print(f"Failed: {Colors.RED}{results['failed']}{Colors.END}")
+    print("="*80)
     
-    if results.get("critical_failure"):
-        print(f"\n{Colors.RED}{'='*70}")
-        print("CRITICAL FAILURE - TESTS COULD NOT COMPLETE")
-        print(f"{'='*70}{Colors.END}\n")
-    elif results['failed'] == 0:
-        print(f"\n{Colors.GREEN}{'='*70}")
-        print("ALL TESTS PASSED ✓✓")
-        print(f"{'='*70}{Colors.END}\n")
+    passed = sum(1 for r in test_results if r["pass"])
+    failed = sum(1 for r in test_results if not r["pass"])
+    
+    print(f"\nTotal tests: {len(test_results)}")
+    print(f"Passed: {passed}")
+    print(f"Failed: {failed}")
+    
+    if failed > 0:
+        print("\nFAILED TESTS:")
+        for r in test_results:
+            if not r["pass"]:
+                print(f"  ✗ {r['key']} - {r['test_name']}")
+                for detail in r['details']:
+                    print(f"    {detail}")
+    
+    print("\n" + "="*80)
+    if failed == 0:
+        print("✓✓ ALL TESTS PASSED ✓✓")
     else:
-        print(f"\n{Colors.YELLOW}{'='*70}")
-        print("SOME TESTS FAILED")
-        if not key_test_passed:
-            print(f"{Colors.RED}KEY TEST FAILED: User flyovers NOT reducing crossings{Colors.END}")
-        print(f"{'='*70}{Colors.END}\n")
+        print(f"✗✗ {failed} TESTS FAILED ✗✗")
+    print("="*80)
+
 
 if __name__ == "__main__":
     main()

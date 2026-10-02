@@ -103,11 +103,260 @@
 #====================================================================================================
 
 user_problem_statement: |
-  User reported (Hindi): the transport route is being drawn THROUGH the railway line (phatak).
-  The "Avoid railway crossing" option should avoid the railway line but it is still crossing it.
-  Fix so the avoid option truly avoids crossing the rail line.
+  Two bug fixes in the Dispatch Report (DailyReport) page:
+  (1) Single-day date picker: after selecting an old date, reopening the calendar showed the
+      CURRENT month instead of the selected date's month. Fixed by controlling the displayed month.
+  (2) Date-range mode: a party's dispatches across multiple days were merged into ONE customer block.
+      Requirement: segregate date-wise — one block per (day, customer), rendered under date headers.
 
 backend:
+  - task: "Add / Edit / Delete action permissions (30 keys, 10 modules)"
+    implemented: true
+    working: true
+    file: "backend/server.py"
+    stuck_count: 0
+    priority: "high"
+    needs_retesting: false
+    status_history:
+        - working: "NA"
+          agent: "main"
+          comment: "New add:<module> keys + existing edit:/delete:. Create endpoints gated with require_action('add:X'). Non-admin gets 403 unless key granted; admin always allowed. migrate_add_permissions() on startup/restore."
+        - working: true
+          agent: "testing"
+          comment: |
+            ✓✓ ALL 30 PERMISSION KEYS TESTED - 100% PASS RATE ✓✓
+            
+            Comprehensive testing completed on the Add/Edit/Delete action permission system.
+            Tested all 30 permission keys (10 modules × 3 actions) with zzqa_admin and zzqa_user accounts.
+            
+            TEST RESULTS SUMMARY:
+            - Total permission keys tested: 30
+            - Passed: 30 (100%)
+            - Failed: 0
+            
+            MODULES TESTED (3 keys each: add/edit/delete):
+            1. ✓ customers (add:customers, edit:customers, delete:customers)
+            2. ✓ products (add:products, edit:products, delete:products)
+            3. ✓ rawMaterials (add:rawMaterials, edit:rawMaterials, delete:rawMaterials)
+            4. ✓ suppliers (add:suppliers, edit:suppliers, delete:suppliers)
+            5. ✓ priceLists (add:priceLists, edit:priceLists, delete:priceLists)
+            6. ✓ vendorPriceLists (add:vendorPriceLists, edit:vendorPriceLists, delete:vendorPriceLists)
+            7. ✓ orders (add:orders, edit:orders, delete:orders)
+            8. ✓ dispatch (add:dispatch, edit:dispatch, delete:dispatch)
+            9. ✓ customerLedger (add:customerLedger, edit:customerLedger, delete:customerLedger)
+            10. ✓ vendorLedger (add:vendorLedger, edit:vendorLedger, delete:vendorLedger)
+            
+            VERIFICATION TESTS PASSED:
+            ✓ GET /api/permissions/catalog returns all 30 action keys
+            ✓ PATCH /api/users/{uid}/permissions accepts all 30 valid keys
+            ✓ PATCH /api/users/{uid}/permissions rejects invalid keys with 400
+            ✓ zzqa_user WITHOUT a key gets 403 (permission denied)
+            ✓ zzqa_user WITH the key gets allowed (not 403)
+            ✓ zzqa_admin can perform all operations (bypasses permission checks)
+            ✓ Keys are independent: granting add:X does NOT grant edit:X or delete:X
+            ✓ Permission check happens BEFORE body validation (403 before 422)
+            
+            KEY INDEPENDENCE TEST:
+            ✓ Granted only add:customers to zzqa_user
+            ✓ Attempted edit:customers → 403 (correctly denied)
+            ✓ Attempted delete:customers → 403 (correctly denied)
+            
+            CLEANUP:
+            ✓ All ZZQA test records deleted (customers, products, raw materials, suppliers, price lists, vendor price lists)
+            ✓ zzqa_user permissions reset to nav keys only
+            ✓ No test data left in production database
+            
+            ENDPOINT MAPPING VERIFIED:
+            - customers: POST /api/customers (add), PATCH /api/customers/{id} (edit), DELETE /api/customers/{id} (delete)
+            - products: POST /api/products (add), PATCH /api/products/{id} (edit), DELETE /api/products/{id} (delete)
+            - rawMaterials: POST /api/raw-materials (add), PATCH /api/raw-materials/{id} (edit), DELETE /api/raw-materials/{id} (delete)
+            - suppliers: POST /api/suppliers (add), PATCH /api/suppliers/{id} (edit), DELETE /api/suppliers/{id} (delete)
+            - priceLists: POST /api/price-lists (add), PATCH /api/price-lists/{id} (edit), DELETE /api/price-lists/{id} (delete)
+            - vendorPriceLists: POST /api/vendor-price-lists (add), PATCH /api/vendor-price-lists/{id} (edit), DELETE /api/vendor-price-lists/{id} (delete)
+            - orders: POST /api/orders (add), PATCH /api/orders/{id}/status (edit), DELETE /api/orders/{id} (delete)
+            - dispatch: POST /api/dispatch/execute (add), PATCH /api/dispatches/{id} (edit), DELETE /api/dispatches/{id} (delete)
+            - customerLedger: POST /api/payments (add), PATCH /api/payments/{id} (edit), DELETE /api/payments/{id} (delete)
+            - vendorLedger: POST /api/supplier-purchases (add), PATCH /api/supplier-purchases/{id} (edit), DELETE /api/supplier-purchases/{id} (delete)
+            
+            CONCLUSION: The permission system is working perfectly. All 30 action keys are properly enforced,
+            admins bypass all checks, non-admins get 403 without the key and are allowed with the key, and
+            keys are independent (add doesn't grant edit/delete). The PATCH permissions endpoint correctly
+            validates and accepts all 30 keys while rejecting invalid ones.
+  - task: "Daily dispatch report - date-wise segregation in RANGE mode"
+    implemented: true
+    working: true
+    file: "backend/server.py"
+    stuck_count: 0
+    priority: "high"
+    needs_retesting: false
+    status_history:
+        -working: "NA"
+        -agent: "main"
+        -comment: |
+          GET /api/reports/daily-dispatch now segregates by IST day in RANGE mode.
+          When end_date != date (range), the grouping key becomes (ist_day + customer_id) so the same
+          party appears once PER DAY instead of merged across the whole range. Each group now carries a
+          "day" (YYYY-MM-DD IST) field, response includes "range_mode": bool, and groups are sorted by
+          (day asc, customer_name) in range mode. Single-day mode is UNCHANGED (key=customer_id, no day
+          segregation, sorted by customer_name).
+          TEST (admin/admin123):
+          (1) GET /api/reports/daily-dispatch?date=<d> (single day) -> range_mode=false, each group has one
+              customer, day field present, dispatch_count correct; behaviour identical to before.
+          (2) GET /api/reports/daily-dispatch?date=<d1>&end_date=<d2> spanning a party that has dispatches on
+              multiple days -> range_mode=true, that party appears MULTIPLE times (once per day), each group's
+              dispatches all share the same IST day, and grand_total_pcs/value == sum of all groups.
+          (3) Verify no dispatch is dropped: total dispatch_count across groups == number of dispatches in range.
+          Use existing seeded data (e.g. HIMANSHU MOTORS has dispatches across several 2026 dates).
+        -working: true
+        -agent: "testing"
+        -comment: |
+          ✓✓ ALL TESTS PASSED - DATE-WISE SEGREGATION WORKING CORRECTLY ✓✓
+          
+          Tested GET /api/reports/daily-dispatch with user account (username=user, password=user123, otp_login=false).
+          
+          TEST 1: SINGLE DAY MODE (date=2026-07-28)
+          - Status: 200 ✓
+          - range_mode: False ✓
+          - groups: 15 unique customers
+          - dispatch_count: 15
+          - grand_total_pcs: 8189
+          - All required fields present (range_mode, groups, grand_total_pcs, grand_total_value, dispatch_count, date, end_date) ✓
+          - Each group has "day" field ✓
+          - No duplicate customer_ids (each customer appears once) ✓
+          
+          TEST 2: RANGE MODE (date=2026-07-28, end_date=2026-08-14)
+          - Status: 200 ✓
+          - range_mode: True ✓
+          - groups: 260 (date-wise segregated)
+          - dispatch_count: 260
+          - grand_total_pcs: 111236
+          - Found 59 parties with dispatches on multiple days ✓
+          
+          KEY VERIFICATION - Date-wise segregation:
+          Example party: ENGI EXPORTS (customer_id=e674413e-edf5-49f1-93eb-8fb9838a6374)
+          - Appears on 5 different days: ['2026-07-28', '2026-08-01', '2026-08-05', '2026-08-08', '2026-08-14'] ✓
+          - Each day has a separate group (5 groups total for this party) ✓
+          - Verified: ALL dispatches within each group share the SAME IST day as group["day"] ✓
+          - No dispatch day mismatches found ✓
+          
+          TEST 3: NO DATA LOSS
+          - Sum of all groups' dispatch_count (260) == grand dispatch_count (260) ✓
+          - Sum of all groups' total_pcs (111236) == grand_total_pcs (111236) ✓
+          - Sum of all groups' total_value (6519157.00) == grand_total_value (6519157.00) ✓
+          - No data loss detected ✓
+          
+          TEST 4: EDGE CASE (end_date < date)
+          - GET /api/reports/daily-dispatch?date=2026-09-30&end_date=2026-08-01
+          - Status: 400 (correctly rejects invalid range) ✓
+          
+          TEST 5: BACKEND LOGS
+          - No errors, tracebacks, or exceptions in backend logs ✓
+          - No 500 errors during any test calls ✓
+          
+          CONCLUSION: The date-wise segregation feature is working perfectly. In range mode, parties with
+          dispatches on multiple days now appear as separate groups (one per day), and each group's dispatches
+          correctly share the same IST day. Single-day mode remains unchanged. All data integrity checks passed.
+
+frontend:
+  - task: "Users access screen Add/Edit/Delete grid + per-page buttons respect permissions"
+    implemented: true
+    working: true
+    file: "frontend/src/pages/AdminUsers.jsx, lib/permissions.js, pages/*"
+    stuck_count: 0
+    priority: "high"
+    needs_retesting: false
+    status_history:
+        - working: "NA"
+          agent: "main"
+          comment: "3-col Add|Edit|Delete in Manage Access dialog; Access Report shows A/E/D chips. Known gap: Add buttons are not hidden for users lacking add perm (backend returns 403 toast)."
+        - working: true
+          agent: "testing"
+          comment: |
+            ✓✓ USERS ACCESS SCREEN & PERMISSION BUTTONS TESTED ✓✓
+            
+            TEST 1: Users Access Screen (as zzqa_admin) - PASSED
+            ✓ Access dialog opens for ZZQA User
+            ✓ Add/Edit/Delete permissions section present with 30 checkboxes (10 modules × 3 actions)
+            ✓ All 30 labels visible and readable:
+              - Customer list (add/edit/delete)
+              - Products list (add/edit/delete)
+              - Raw material (add/edit/delete)
+              - Vendor list (add/edit/delete)
+              - Vendor ledger (add/edit/delete)
+              - Customer ledger (add/edit/delete)
+              - Orders (add/edit/delete)
+              - Dispatch report (add/edit/delete)
+              - Customer price list (add/edit/delete)
+              - Vendor price list (add/edit/delete)
+            ✓ Dialog scrolls properly
+            ✓ Save button visible and reachable
+            ✓ Granted add:customers and edit:customers (NOT delete:customers)
+            ✓ Permissions saved successfully
+            
+            TEST 2: Per-Page Button Visibility (as zzqa_user) - CONFIRMED KNOWN GAP
+            The known gap is CONFIRMED: Add buttons are visible to users without add permission.
+            The backend correctly blocks with 403, but the UI does not hide the buttons.
+            
+            BUTTON VISIBILITY FINDINGS:
+            - Customers: Add visible (granted), Edit visible (granted), Delete hidden (correct - not granted)
+            - Products: Add visible (no perm), Edit hidden (correct), Delete hidden (correct)
+            - Raw Materials: Add visible (no perm), Edit hidden (correct), Delete hidden (correct)
+            - Suppliers: Add visible (no perm), Edit hidden (correct), Delete hidden (correct)
+            - Customer Price Lists: Add visible (no perm), Edit hidden (correct), Delete hidden (correct)
+            - Vendor Price Lists: Add visible (no perm), Edit hidden (correct), Delete hidden (correct)
+            - Orders: Add visible (no perm), Edit hidden (correct), Delete hidden (correct)
+            - Dispatch Center: Add visible (no perm)
+            - Customer Ledger: Add visible (no perm)
+            - Vendor Ledger: Add visible (no perm)
+            - Purchase Center: Add visible (no perm)
+            
+            CONCLUSION:
+            ✓ Users Access Screen UI is working correctly (30 checkboxes, proper layout, persistence)
+            ✓ Edit/Delete buttons correctly hidden for users without permissions
+            ⚠ KNOWN GAP CONFIRMED: Add buttons are NOT hidden for users without add permission
+              (This is the expected behavior per main agent's comment - backend blocks with 403 toast)
+            
+            The permission system is working as designed. The UI shows Add buttons to all users,
+            and the server enforces permissions by returning 403 when unauthorized users attempt to add.
+  - task: "DatePicker & DailyReport calendars open on selected date's month"
+    implemented: true
+    working: "NA"
+    file: "frontend/src/components/DatePicker.jsx, frontend/src/pages/DailyReport.jsx"
+    stuck_count: 0
+    priority: "high"
+    needs_retesting: true
+    status_history:
+        -working: "NA"
+        -agent: "main"
+        -comment: |
+          Bug: reopening the single-day date picker in Dispatch Report always showed the current month
+          (e.g. October) even when an old date (e.g. 2026-07-28) was selected. Root cause: the shadcn
+          Calendar only had defaultMonth (uncontrolled). Fix: made the displayed month CONTROLLED via
+          month/onMonthChange state, and a useEffect snaps the month back to the selected date every time
+          the popover opens. Applied to DailyReport inline start & end calendars AND the shared DatePicker.
+          TEST: Login admin/admin123 -> Dispatch Report -> Single day -> pick an OLD date (prev month) ->
+          reopen the date picker -> calendar MUST open on the selected date's month with that date highlighted.
+
+  - task: "Dispatch Report range mode renders date-wise sections"
+    implemented: true
+    working: "NA"
+    file: "frontend/src/pages/DailyReport.jsx"
+    stuck_count: 0
+    priority: "high"
+    needs_retesting: true
+    status_history:
+        -working: "NA"
+        -agent: "main"
+        -comment: |
+          In range mode the report now renders a dark date header (weekday, dd mon yyyy) before each new day's
+          groups, and the same party appears once per day. React keys / collapse state / testids use a
+          composite key (day|customer_id) so collapsing one day doesn't affect the same party on another day.
+          Single-day mode is visually unchanged.
+          TEST: Login admin/admin123 -> Dispatch Report -> Date range spanning multiple days that include a
+          party with dispatches on >1 day -> verify date section headers appear and the party shows separately
+          under each date (not merged). Collapsing one day's block must not collapse the other day's block.
+
+backend_legacy:
   - task: "Editable route start point (factory location)"
     implemented: true
     working: "NA"
@@ -288,15 +537,60 @@ metadata:
   run_ui: false
 
 test_plan:
-  current_focus: []
+  current_focus:
+    - "Users access screen Add/Edit/Delete grid + per-page buttons respect permissions"
   stuck_tasks: []
   test_all: false
   test_priority: "high_first"
 
 agent_communication:
+    -agent: "testing"
+    -message: |
+      ✓✓ USERS ACCESS SCREEN & PERMISSION BUTTONS TEST COMPLETE ✓✓
+      
+      Tested the Users access screen and Add/Edit/Delete button visibility across all pages.
+      
+      TEST 1 - Users Access Screen (as zzqa_admin): PASSED
+      ✓ Access dialog opens correctly
+      ✓ 30 checkboxes present (10 modules × 3 actions: Add/Edit/Delete)
+      ✓ All labels visible and readable (not cut off)
+      ✓ Dialog scrolls, Save button reachable
+      ✓ Permissions persist after save
+      ✓ Access Report shows correct A/E/D chips
+      
+      TEST 2 - Per-Page Button Visibility (as zzqa_user): CONFIRMED KNOWN GAP
+      ✓ Edit/Delete buttons correctly HIDDEN for users without permissions
+      ⚠ Add buttons are VISIBLE to all users (known gap - backend blocks with 403)
+      
+      PAGES TESTED:
+      - Customers: Add visible (granted), Edit visible (granted), Delete hidden ✓
+      - Products: Add visible (no perm), Edit hidden ✓, Delete hidden ✓
+      - Raw Materials: Add visible (no perm), Edit hidden ✓, Delete hidden ✓
+      - Suppliers: Add visible (no perm), Edit hidden ✓, Delete hidden ✓
+      - Customer Price Lists: Add visible (no perm), Edit hidden ✓, Delete hidden ✓
+      - Vendor Price Lists: Add visible (no perm), Edit hidden ✓, Delete hidden ✓
+      - Orders: Add visible (no perm), Edit hidden ✓, Delete hidden ✓
+      - Dispatch Center: Add visible (no perm)
+      - Customer Ledger: Add visible (no perm)
+      - Vendor Ledger: Add visible (no perm)
+      - Purchase Center: Add visible (no perm)
+      
+      CONCLUSION: The permission system is working as designed. The known gap (Add buttons
+      visible to all users) is confirmed and expected - the backend correctly enforces
+      permissions with 403 responses.
+      
+      CLEANUP: All ZZQA test records deleted, zzqa_user permissions reset.
     -agent: "main"
     -message: |
-      SECOND FIX applied after testing found the avoid route was identical to shortest.
+      Two Dispatch Report fixes applied. Please test BACKEND first:
+      GET /api/reports/daily-dispatch (admin/admin123).
+      (1) Single day (date only): response range_mode=false; groups keyed per customer; each group has a
+          "day" field; no party duplicated.
+      (2) Range (date + end_date across multiple days for a party with multi-day dispatches, e.g. HIMANSHU
+          MOTORS): range_mode=true; that party appears once PER DAY; every dispatch inside a group shares the
+          same IST day; sum of all groups' totals == grand_total_pcs / grand_total_value; total dispatch
+          count across groups == dispatch_count (nothing dropped).
+      Do NOT test frontend yet (will ask user separately).
       Two things done:
       (A) Root-cause detection: routes crossing the rail LINE (not only OSM level_crossing nodes) are now
           detected via geometry intersection (_rail_line_hits) and threaded through counting + avoidance.
@@ -363,3 +657,62 @@ agent_communication:
       
       This proves the user's issue is resolved: they can now mark flyovers they know about, and the
       avoidance route will honor those flyovers and reduce railway crossings accordingly.
+    -agent: "testing"
+    -message: |
+      ✓✓ BACKEND TEST COMPLETE - DATE-WISE SEGREGATION WORKING ✓✓
+      
+      Tested GET /api/reports/daily-dispatch endpoint comprehensively. All tests passed:
+      
+      1. ✓ SINGLE DAY MODE: range_mode=false, 15 groups, no duplicate customers, all fields present
+      2. ✓ RANGE MODE: range_mode=true, 260 groups with date-wise segregation
+      3. ✓ KEY VERIFICATION: Found 59 parties with multi-day dispatches
+         - Example: ENGI EXPORTS appears on 5 different days as 5 separate groups
+         - All dispatches within each group share the same IST day as group["day"]
+      4. ✓ NO DATA LOSS: Sum of groups equals grand totals (dispatch_count, total_pcs, total_value)
+      5. ✓ EDGE CASE: end_date < date correctly returns 400
+      6. ✓ NO ERRORS: No tracebacks or 500s in backend logs
+      
+      The date-wise segregation feature is working perfectly. Parties with dispatches on multiple days
+      now appear as separate groups (one per day) in range mode, exactly as required.
+      
+      NOTE: Frontend testing (DatePicker calendar month & date-wise UI sections) is still pending.
+      As per instructions, DO NOT test frontend - will ask user separately.
+    -agent: "testing"
+    -message: |
+      ✓✓ PERMISSION SYSTEM TEST COMPLETE - ALL 30 KEYS VERIFIED ✓✓
+      
+      Comprehensive testing completed on the Add/Edit/Delete action permission system (30 keys, 10 modules).
+      
+      TEST RESULTS:
+      - Total permission keys: 30 (10 modules × 3 actions)
+      - Passed: 30 (100%)
+      - Failed: 0
+      
+      VERIFIED:
+      1. ✓ GET /api/permissions/catalog returns all 30 action keys
+      2. ✓ PATCH /api/users/{uid}/permissions accepts all 30 valid keys
+      3. ✓ PATCH /api/users/{uid}/permissions rejects invalid keys with 400
+      4. ✓ zzqa_user WITHOUT a key → 403 (permission denied)
+      5. ✓ zzqa_user WITH the key → allowed (not 403)
+      6. ✓ zzqa_admin can perform all operations
+      7. ✓ Keys are independent: add:X does NOT grant edit:X or delete:X
+      8. ✓ Permission check happens BEFORE body validation
+      
+      ALL 10 MODULES TESTED:
+      ✓ customers (add/edit/delete)
+      ✓ products (add/edit/delete)
+      ✓ rawMaterials (add/edit/delete)
+      ✓ suppliers (add/edit/delete)
+      ✓ priceLists (add/edit/delete)
+      ✓ vendorPriceLists (add/edit/delete)
+      ✓ orders (add/edit/delete)
+      ✓ dispatch (add/edit/delete)
+      ✓ customerLedger (add/edit/delete)
+      ✓ vendorLedger (add/edit/delete)
+      
+      CLEANUP:
+      ✓ All ZZQA test records deleted
+      ✓ zzqa_user permissions reset to nav keys only
+      ✓ No test data left in production database
+      
+      The permission system is working perfectly. All requirements met.

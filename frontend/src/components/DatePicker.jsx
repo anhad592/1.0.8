@@ -1,4 +1,4 @@
-import React, { useState } from "react";
+import React, { useState, useEffect } from "react";
 import { Calendar as CalendarIcon } from "lucide-react";
 import { Calendar } from "@/components/ui/calendar";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
@@ -55,6 +55,19 @@ export default function DatePicker({
   const maxDate = parseYmd(max);
   const minDate = parseYmd(min);
 
+  // Controlled displayed month so that re-opening the calendar always jumps
+  // back to the currently selected date's month (not the current month).
+  const [month, setMonth] = useState(selected || maxDate || new Date());
+
+  // Whenever the popover opens (or the selected value changes), snap the
+  // visible month to the selected date.
+  useEffect(() => {
+    if (open) {
+      setMonth(parseYmd(value) || maxDate || new Date());
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open, value]);
+
   const disabledMatchers = [];
   if (maxDate) disabledMatchers.push({ after: maxDate });
   if (minDate) disabledMatchers.push({ before: minDate });
@@ -85,6 +98,8 @@ export default function DatePicker({
         <Calendar
           mode="single"
           selected={selected}
+          month={month}
+          onMonthChange={setMonth}
           defaultMonth={selected || maxDate || new Date()}
           onSelect={(d) => {
             if (!d) return;

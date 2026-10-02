@@ -330,6 +330,9 @@ DEFAULT_USER_PERMISSIONS: List[str] = [
     "dashboard", "orders", "dispatch", "dispatchLedger", "dailyReport",
     "estimates",
     "customers", "products",
+    # Historical behaviour: any user could create orders / dispatches /
+    # customer payments, so the null-permission default keeps those adds.
+    "add:orders", "add:dispatch", "add:customerLedger",
 ]
 
 # ---- Action (edit / delete) permission keys ----------------------------
@@ -340,16 +343,16 @@ DEFAULT_USER_PERMISSIONS: List[str] = [
 # Non-admins have NONE by default (view-only) — must be granted explicitly.
 # Admins always have all of them.
 ACTION_PERMISSION_KEYS: List[str] = [
-    "edit:customers", "delete:customers",
-    "edit:products", "delete:products",
-    "edit:rawMaterials", "delete:rawMaterials",
-    "edit:suppliers", "delete:suppliers",
-    "edit:vendorLedger", "delete:vendorLedger",
-    "edit:customerLedger", "delete:customerLedger",
-    "edit:orders", "delete:orders",
-    "edit:dispatch", "delete:dispatch",
-    "edit:priceLists", "delete:priceLists",
-    "edit:vendorPriceLists", "delete:vendorPriceLists",
+    "add:customers", "edit:customers", "delete:customers",
+    "add:products", "edit:products", "delete:products",
+    "add:rawMaterials", "edit:rawMaterials", "delete:rawMaterials",
+    "add:suppliers", "edit:suppliers", "delete:suppliers",
+    "add:vendorLedger", "edit:vendorLedger", "delete:vendorLedger",
+    "add:customerLedger", "edit:customerLedger", "delete:customerLedger",
+    "add:orders", "edit:orders", "delete:orders",
+    "add:dispatch", "edit:dispatch", "delete:dispatch",
+    "add:priceLists", "edit:priceLists", "delete:priceLists",
+    "add:vendorPriceLists", "edit:vendorPriceLists", "delete:vendorPriceLists",
 ]
 
 # Everything an admin may grant / revoke (nav access + edit/delete actions).
@@ -584,7 +587,11 @@ def require_action(action_key: str):
         if not has_action_permission(user, action_key):
             raise HTTPException(
                 status_code=403,
-                detail="You don't have permission to edit or delete here. Ask an admin to grant access.",
+                detail=(
+                    "You don't have permission to add here. Ask an admin to grant access."
+                    if action_key.startswith("add:") else
+                    "You don't have permission to edit or delete here. Ask an admin to grant access."
+                ),
             )
         return user
     return _dep
@@ -884,6 +891,7 @@ async def create_user(body: AdminUserCreate, admin=Depends(require_users_admin))
         "role": body.role,
         "otp_login": bool(body.otp_login),
         "created_at": now_iso(),
+        "add_perms_v1": True,
     }
     # Optional explicit permission allowlist (validated against the catalog).
     if body.permissions is not None:
@@ -969,7 +977,7 @@ async def set_user_permissions(uid: str, body: UserPermissionsUpdate, admin=Depe
     prev_perms = prev_user.get("permissions")
     await db.users.update_one(
         {"id": uid},
-        {"$set": {"permissions": ordered, "updated_at": now_iso()}},
+        {"$set": {"permissions": ordered, "updated_at": now_iso(), "add_perms_v1": True}},
     )
     # Diff for the audit log. We compare against the *effective* set the user
     # had before — so admins can see what actually changed for the operator,
@@ -1316,7 +1324,9 @@ async def restore_backup(file: UploadFile = File(...), admin=Depends(require_adm
     if len(blob) > 200 * 1024 * 1024:
         raise HTTPException(status_code=413, detail="Backup file too large (max 200 MB)")
     try:
-        return await backup_mod.restore_from_zip(db, blob)
+        result = await backup_mod.restore_from_zip(db, blob)
+        await migrate_add_permissions()
+        return result
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -1330,7 +1340,7 @@ async def list_products(user=Depends(get_current_user)):
 
 
 @api_router.post("/products")
-async def create_product(body: ProductIn, user=Depends(require_admin)):
+async def create_product(body: ProductIn, user=Depends(require_action("add:products"))):
     if await db.products.find_one({"name": body.name}):
         raise HTTPException(status_code=400, detail="Product already exists")
     doc = {"id": str(uuid.uuid4()), **body.model_dump(), "created_at": now_iso()}
@@ -1439,7 +1449,7 @@ async def get_item(iid: str, user=Depends(get_current_user)):
 
 
 @api_router.post("/items")
-async def create_item(body: ItemCreate, admin=Depends(require_admin)):
+async def create_item(body: ItemCreate, admin=Depends(require_action("add:products"))):
     """Admin: create a new SKU under an existing master product."""
     prod = await db.products.find_one({"id": body.product_id}, {"_id": 0})
     if not prod:
@@ -1568,7 +1578,7 @@ async def search_customers(q: str = "", user=Depends(get_current_user)):
 
 
 @api_router.post("/customers")
-async def create_customer(body: CustomerIn, user=Depends(require_admin)):
+async def create_customer(body: CustomerIn, user=Depends(require_action("add:customers"))):
     doc = {"id": str(uuid.uuid4()), **body.model_dump(), "created_at": now_iso()}
     await db.customers.insert_one(doc)
     doc.pop("_id", None)
@@ -1736,7 +1746,7 @@ async def customer_import_template(admin=Depends(require_admin)):
 
 
 @api_router.post("/customers/import")
-async def import_customers(file: UploadFile = File(...), admin=Depends(require_admin)):
+async def import_customers(file: UploadFile = File(...), admin=Depends(require_action("add:customers"))):
     """Admin: bulk import customers from an Excel file.
 
     Columns recognised (case-insensitive header row required):
@@ -1916,7 +1926,7 @@ async def _persist_customer_prefs(customer_id: str, items: List[OrderItemIn]):
 
 
 @api_router.post("/orders")
-async def create_order(body: OrderIn, user=Depends(get_current_user)):
+async def create_order(body: OrderIn, user=Depends(require_action("add:orders"))):
     cust = await db.customers.find_one({"id": body.customer_id}, {"_id": 0})
     if not cust:
         raise HTTPException(status_code=404, detail="Customer not found")
@@ -2719,7 +2729,7 @@ async def dispatch_match(body: DispatchStockIn, user=Depends(get_current_user)):
 
 
 @api_router.post("/dispatch/execute")
-async def dispatch_execute(body: DispatchExecuteIn, user=Depends(get_current_user)):
+async def dispatch_execute(body: DispatchExecuteIn, user=Depends(require_action("add:dispatch"))):
     """Partially fulfill a pending order. Subtracts the given quantities from
     each item line. Items hitting 0 are removed. If the order has no items
     left, it is marked Dispatched; otherwise it stays Pending so the
@@ -3809,7 +3819,7 @@ async def list_price_lists(user=Depends(get_current_user)):
 
 
 @api_router.post("/price-lists")
-async def create_price_list(body: PriceListIn, admin=Depends(require_admin)):
+async def create_price_list(body: PriceListIn, admin=Depends(require_action("add:priceLists"))):
     name = body.name.strip()
     if not name:
         raise HTTPException(status_code=400, detail="Name required")
@@ -3857,7 +3867,7 @@ async def delete_price_list(plid: str, admin=Depends(require_action("delete:pric
 
 
 @api_router.post("/price-lists/{plid}/clone")
-async def clone_price_list(plid: str, body: PriceListCloneIn, admin=Depends(require_admin)):
+async def clone_price_list(plid: str, body: PriceListCloneIn, admin=Depends(require_action("add:priceLists"))):
     """Duplicate an existing price list under a new name, copying every
     per-item price and per-category discount as-is. Customer linkages are
     NOT copied — the new list starts unassigned."""
@@ -4043,7 +4053,7 @@ async def export_price_list(plid: str, user=Depends(get_current_user)):
 
 
 @api_router.post("/price-lists/{plid}/import")
-async def import_price_list(plid: str, file: UploadFile = File(...), admin=Depends(require_admin)):
+async def import_price_list(plid: str, file: UploadFile = File(...), admin=Depends(require_action("add:priceLists"))):
     """Upload Excel with rows: Item Name | Price. Matches each row to an
     existing item (case-insensitive, fuzzy fallback ≥85). Unknown rows are
     returned for review. Existing prices are overwritten."""
@@ -4224,20 +4234,37 @@ async def daily_dispatch_report(date: Optional[str] = None, end_date: Optional[s
 
     grand_pcs = 0
     grand_value = 0.0
+    range_mode = end_target != target
+    def _ist_day(ts):
+        if not ts:
+            return target.isoformat()
+        try:
+            dt = datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt.astimezone(IST).date().isoformat()
+        except Exception:
+            return target.isoformat()
     for d in dispatches:
         cid = d.get("customer_id") or "unknown"
+        # In RANGE mode, segregate the same party's dispatches by the IST day
+        # they were dispatched — one group per (day, customer) — so the report
+        # reads date-wise instead of merging a customer's whole range together.
+        day = _ist_day(d.get("dispatched_at"))
+        gkey = f"{day}|{cid}" if range_mode else cid
         cust = customers_cache.get(cid)
         if cust is None and cid != "unknown":
             cust = await db.customers.find_one({"id": cid}, {"_id": 0}) or {}
             customers_cache[cid] = cust
         if cust is None:
             cust = {}
-        g = groups.get(cid)
+        g = groups.get(gkey)
         if not g:
             pl_id = cust.get("price_list_id")
             pl_meta = await _price_list_meta(pl_id)
             g = {
                 "customer_id": cid,
+                "day": day,
                 "customer_name": d.get("customer_name") or cust.get("name") or "—",
                 "transport_name": cust.get("transport_name") or "",
                 "phone": cust.get("phone") or "",
@@ -4258,7 +4285,7 @@ async def daily_dispatch_report(date: Optional[str] = None, end_date: Optional[s
                 "total_value": 0.0,
                 "dispatch_count": 0,
             }
-            groups[cid] = g
+            groups[gkey] = g
         g["dispatch_count"] += 1
         # Enrich the raw items with live pricing so the client-side Edit
         # dialog opens with the SAME net/unit price the report row shows
@@ -4357,10 +4384,15 @@ async def daily_dispatch_report(date: Optional[str] = None, end_date: Optional[s
             grand_pcs += qty
             grand_value += value
         g["total_value"] = round(g["total_value"], 2)
-    out_groups = sorted(groups.values(), key=lambda g: g["customer_name"].lower())
+    if range_mode:
+        # Date-wise first (ascending), then party name within each day.
+        out_groups = sorted(groups.values(), key=lambda g: (g.get("day", ""), g["customer_name"].lower()))
+    else:
+        out_groups = sorted(groups.values(), key=lambda g: g["customer_name"].lower())
     return {
         "date": target.isoformat(),
         "end_date": end_target.isoformat(),
+        "range_mode": range_mode,
         "groups": out_groups,
         "grand_total_pcs": grand_pcs,
         "grand_total_value": round(grand_value, 2),
@@ -5584,7 +5616,7 @@ async def _deduct_off_order_from_pending_orders(
 
 
 @api_router.post("/dispatch/off-order")
-async def dispatch_off_order(body: OffOrderDispatchIn, user=Depends(get_current_user)):
+async def dispatch_off_order(body: OffOrderDispatchIn, user=Depends(require_action("add:dispatch"))):
     """Dispatch SKUs to a party — used either for walk-ins (no parent
     order) OR for an existing customer where the operator wants to short-
     circuit the regular allocation flow. Now available to BOTH admins and
@@ -5836,7 +5868,7 @@ def _normalize_payment_dt(value: Optional[str]) -> str:
 
 
 @api_router.post("/payments")
-async def create_payment(body: PaymentIn, user=Depends(get_current_user)):
+async def create_payment(body: PaymentIn, user=Depends(require_action("add:customerLedger"))):
     if not body.customer_id:
         raise HTTPException(status_code=400, detail="customer_id required")
     if body.amount is None or float(body.amount) <= 0:
@@ -5990,7 +6022,7 @@ async def list_raw_materials(user=Depends(get_current_user)):
 
 
 @api_router.post("/raw-materials")
-async def create_raw_material(body: RawMaterialIn, admin=Depends(require_admin)):
+async def create_raw_material(body: RawMaterialIn, admin=Depends(require_action("add:rawMaterials"))):
     name = (body.name or "").strip()
     if not name:
         raise HTTPException(status_code=400, detail="name required")
@@ -6086,7 +6118,7 @@ async def list_vendor_price_lists(user=Depends(get_current_user)):
 
 
 @api_router.post("/vendor-price-lists")
-async def create_vendor_price_list(body: VendorPriceListIn, admin=Depends(require_admin)):
+async def create_vendor_price_list(body: VendorPriceListIn, admin=Depends(require_action("add:vendorPriceLists"))):
     name = (body.name or "").strip()
     if not name:
         raise HTTPException(status_code=400, detail="Name required")
@@ -6151,7 +6183,7 @@ async def delete_vendor_price_list(vpl_id: str, admin=Depends(require_action("de
 
 
 @api_router.post("/vendor-price-lists/{vpl_id}/items")
-async def add_vendor_price_list_item(vpl_id: str, body: VendorPriceListItemIn, admin=Depends(require_admin)):
+async def add_vendor_price_list_item(vpl_id: str, body: VendorPriceListItemIn, admin=Depends(require_action("add:vendorPriceLists"))):
     pl = await db.vendor_price_lists.find_one({"id": vpl_id}, {"_id": 0, "id": 1})
     if not pl:
         raise HTTPException(status_code=404, detail="Vendor price list not found")
@@ -6312,7 +6344,7 @@ async def vendor_price_list_export(vpl_id: str, user=Depends(get_current_user)):
 
 
 @api_router.post("/vendor-price-lists/{vpl_id}/import")
-async def vendor_price_list_import(vpl_id: str, file: UploadFile = File(...), admin=Depends(require_admin)):
+async def vendor_price_list_import(vpl_id: str, file: UploadFile = File(...), admin=Depends(require_action("add:vendorPriceLists"))):
     """Bulk import items into a vendor price list from Excel.
 
     Columns recognised (case-insensitive header row): name, unit, price, notes.
@@ -6491,7 +6523,7 @@ async def list_suppliers(user=Depends(get_current_user)):
 
 
 @api_router.post("/suppliers")
-async def create_supplier(body: SupplierIn, admin=Depends(require_admin)):
+async def create_supplier(body: SupplierIn, admin=Depends(require_action("add:suppliers"))):
     name = (body.name or "").strip()
     if not name:
         raise HTTPException(status_code=400, detail="name required")
@@ -6552,7 +6584,7 @@ async def delete_supplier(sid: str, admin=Depends(require_action("delete:supplie
 
 
 @api_router.post("/supplier-purchases")
-async def create_supplier_purchase(body: SupplierPurchaseIn, user=Depends(get_current_user)):
+async def create_supplier_purchase(body: SupplierPurchaseIn, user=Depends(require_action("add:vendorLedger"))):
     if not body.supplier_id:
         raise HTTPException(status_code=400, detail="supplier_id required")
     # Amount may be zero — purchases can be saved without a price (per user
@@ -6822,7 +6854,7 @@ async def update_supplier_purchase(
 
 
 @api_router.post("/supplier-payments")
-async def create_supplier_payment(body: SupplierPaymentIn, user=Depends(get_current_user)):
+async def create_supplier_payment(body: SupplierPaymentIn, user=Depends(require_action("add:vendorLedger"))):
     if not body.supplier_id:
         raise HTTPException(status_code=400, detail="supplier_id required")
     if body.amount is None or float(body.amount) <= 0:
@@ -6964,7 +6996,7 @@ def _normalize_return_dt(s: Optional[str]) -> str:
 
 
 @api_router.post("/sale-returns")
-async def create_sale_return(body: SaleReturnIn, user=Depends(get_current_user)):
+async def create_sale_return(body: SaleReturnIn, user=Depends(require_action("add:customerLedger"))):
     if not body.customer_id:
         raise HTTPException(status_code=400, detail="customer_id required")
     if body.amount is None or float(body.amount) <= 0:
@@ -7074,7 +7106,7 @@ class PurchaseReturnUpdate(BaseModel):
 
 
 @api_router.post("/purchase-returns")
-async def create_purchase_return(body: PurchaseReturnIn, user=Depends(get_current_user)):
+async def create_purchase_return(body: PurchaseReturnIn, user=Depends(require_action("add:vendorLedger"))):
     if not body.supplier_id:
         raise HTTPException(status_code=400, detail="supplier_id required")
     if body.amount is None or float(body.amount) <= 0:
@@ -7884,14 +7916,17 @@ class TransportStop(BaseModel):
 
 class TransportCreate(BaseModel):
     name: str
-    lat: float
-    lng: float
+    lat: Optional[float] = None
+    lng: Optional[float] = None
+    serial: Optional[int] = None
+    needs_location: Optional[bool] = None
 
 
 class TransportUpdate(BaseModel):
     name: Optional[str] = None
     lat: Optional[float] = None
     lng: Optional[float] = None
+    serial: Optional[int] = None
 
 
 class TransportRouteCreate(BaseModel):
@@ -8029,9 +8064,37 @@ async def update_transport_factory(body: FactoryLocationIn, _user=Depends(get_cu
 
 
 # ── Transports master (name + coordinates) ────────────────────────────────
+async def _max_transport_serial() -> int:
+    top = await db.transports.find({"serial": {"$type": "number"}}, {"_id": 0, "serial": 1}).sort("serial", -1).limit(1).to_list(1)
+    return int(top[0]["serial"]) if top else 0
+
+
+async def _make_room_for_serial(tid: Optional[str], new: int, old: Optional[int]) -> int:
+    """Insert/move a transport to serial `new`, shifting the others so the
+    list stays a clean 1..N sequence. Returns the (clamped) serial to use."""
+    mx = await _max_transport_serial()
+    others = {"id": {"$ne": tid}} if tid else {}
+    if old is None:
+        new = max(1, min(int(new), mx + 1))
+        await db.transports.update_many({**others, "serial": {"$gte": new}}, {"$inc": {"serial": 1}})
+    else:
+        new = max(1, min(int(new), mx))
+        if new < old:
+            await db.transports.update_many({**others, "serial": {"$gte": new, "$lt": old}}, {"$inc": {"serial": 1}})
+        elif new > old:
+            await db.transports.update_many({**others, "serial": {"$gt": old, "$lte": new}}, {"$inc": {"serial": -1}})
+    return new
+
 @api_router.get("/transports")
 async def list_transports(_user=Depends(get_current_user)):
-    docs = await db.transports.find({}, {"_id": 0}).sort("name", 1).to_list(1000)
+    docs = await db.transports.find({}, {"_id": 0}).to_list(1000)
+    # Sort by serial order (from the user's master list) ascending; transports
+    # without a serial (not in the master list) sort AFTER, by name.
+    def _key(d):
+        s = d.get("serial")
+        has = isinstance(s, (int, float))
+        return (0 if has else 1, s if has else 0, (d.get("name") or "").lower())
+    docs.sort(key=_key)
     return docs
 
 
@@ -8040,16 +8103,28 @@ async def create_transport(body: TransportCreate, user=Depends(get_current_user)
     name = (body.name or "").strip()
     if not name:
         raise HTTPException(status_code=400, detail="Name is required")
-    if not (-90 <= body.lat <= 90) or not (-180 <= body.lng <= 180):
-        raise HTTPException(status_code=400, detail="Coordinates are out of range")
+    needs_location = bool(body.needs_location)
+    lat = body.lat
+    lng = body.lng
+    if not needs_location:
+        if lat is None or lng is None:
+            raise HTTPException(status_code=400, detail="Coordinates are required")
+        if not (-90 <= lat <= 90) or not (-180 <= lng <= 180):
+            raise HTTPException(status_code=400, detail="Coordinates are out of range")
     existing = await db.transports.find_one({"name": {"$regex": f"^{re.escape(name)}$", "$options": "i"}})
     if existing:
         raise HTTPException(status_code=409, detail="A transport with this name already exists")
+    if body.serial is not None:
+        serial = await _make_room_for_serial(None, int(body.serial), None)
+    else:
+        serial = await _max_transport_serial() + 1
     doc = {
         "id": str(uuid.uuid4()),
         "name": name,
-        "lat": float(body.lat),
-        "lng": float(body.lng),
+        "lat": float(lat) if lat is not None else None,
+        "lng": float(lng) if lng is not None else None,
+        "serial": serial,
+        "needs_location": needs_location,
         "created_at": now_iso(),
         "created_by": user.get("email") or user.get("username") or user.get("id"),
     }
@@ -8071,6 +8146,13 @@ async def update_transport(tid: str, body: TransportUpdate, _user=Depends(get_cu
         if clash:
             raise HTTPException(status_code=409, detail="Another transport already uses this name")
         patch["name"] = nm
+    if body.serial is not None:
+        cur = await db.transports.find_one({"id": tid}, {"_id": 0, "serial": 1})
+        if not cur:
+            raise HTTPException(status_code=404, detail="Transport not found")
+        old = cur.get("serial") if isinstance(cur.get("serial"), (int, float)) else None
+        if old is None or int(body.serial) != int(old):
+            patch["serial"] = await _make_room_for_serial(tid, int(body.serial), int(old) if old is not None else None)
     if body.lat is not None:
         if not (-90 <= body.lat <= 90):
             raise HTTPException(status_code=400, detail="Latitude is out of range")
@@ -8079,6 +8161,9 @@ async def update_transport(tid: str, body: TransportUpdate, _user=Depends(get_cu
         if not (-180 <= body.lng <= 180):
             raise HTTPException(status_code=400, detail="Longitude is out of range")
         patch["lng"] = float(body.lng)
+    # Once a real location is supplied, the transport is no longer "incomplete".
+    if patch.get("lat") is not None and patch.get("lng") is not None:
+        patch["needs_location"] = False
     if not patch:
         raise HTTPException(status_code=400, detail="Nothing to update")
     res = await db.transports.update_one({"id": tid}, {"$set": patch})
@@ -8090,9 +8175,13 @@ async def update_transport(tid: str, body: TransportUpdate, _user=Depends(get_cu
 
 @api_router.delete("/transports/{tid}")
 async def delete_transport(tid: str, _user=Depends(require_admin)):
+    cur = await db.transports.find_one({"id": tid}, {"_id": 0, "serial": 1})
     res = await db.transports.delete_one({"id": tid})
     if res.deleted_count == 0:
         raise HTTPException(status_code=404, detail="Transport not found")
+    # Close the gap so serials stay 1..N.
+    if cur and isinstance(cur.get("serial"), (int, float)):
+        await db.transports.update_many({"serial": {"$gt": cur["serial"]}}, {"$inc": {"serial": -1}})
     return {"ok": True}
 
 
@@ -9071,9 +9160,39 @@ app.add_middleware(
 )
 
 
+# One-time per-user migration when "add:" permissions were introduced.
+# Before, anyone with access to these pages could add records, so grant the
+# matching add: key to keep existing staff working. Users are flagged with
+# `add_perms_v1` so admin un-ticks are never overwritten. Also re-run after a
+# backup restore (restored user docs won't carry the flag).
+_ADD_PERM_FROM_NAV = {
+    "add:orders": ("orders", "newOrder"),
+    "add:dispatch": ("dispatch",),
+    "add:customerLedger": ("dispatchLedger",),
+    "add:vendorLedger": ("vendorLedger", "purchaseCenter"),
+}
+
+
+async def migrate_add_permissions() -> int:
+    n = 0
+    async for u in db.users.find({"add_perms_v1": {"$ne": True}}, {"_id": 0, "id": 1, "permissions": 1}):
+        perms = u.get("permissions")
+        upd: Dict[str, Any] = {"add_perms_v1": True}
+        if isinstance(perms, list):
+            have = set(perms)
+            extra = [k for k, navs in _ADD_PERM_FROM_NAV.items() if k not in have and any(x in have for x in navs)]
+            if extra:
+                have.update(extra)
+                upd["permissions"] = [k for k in ALL_GRANTABLE_KEYS if k in have]
+        await db.users.update_one({"id": u["id"]}, {"$set": upd})
+        n += 1
+    return n
+
+
 @app.on_event("startup")
 async def on_startup():
     await seed_db()
+    await migrate_add_permissions()
     # Backfill: ensure every raw material has a numeric `stock_on_hand`.
     await db.raw_materials.update_many(
         {"stock_on_hand": {"$exists": False}},

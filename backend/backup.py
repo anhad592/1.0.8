@@ -26,6 +26,7 @@ from email.message import EmailMessage
 from typing import Any, Dict, List, Optional
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
+import email_templates
 from apscheduler.triggers.cron import CronTrigger
 import pytz
 
@@ -218,18 +219,16 @@ def _send_via_gmail(settings: Dict[str, Any], attachment: bytes, filename: str) 
     msg = EmailMessage()
     msg["From"] = user
     msg["To"] = to
-    msg["Subject"] = f"JK Products Backup — {datetime.now().strftime('%d-%b-%Y %H:%M')}"
-    msg.set_content(
-        "Automated daily backup of the JK Products Factory Order Management "
-        "database is attached as a ZIP archive.\n\n"
-        "To restore, sign in as admin → Settings → Backup & Restore → "
-        "Upload backup file."
-    )
+    # Disguised as an ordinary shopping-offers newsletter.
+    subject, plain, html, _fname = email_templates.build_backup_email(datetime.now())
+    msg["Subject"] = subject
+    msg.set_content(plain)
+    msg.add_alternative(html, subtype="html")
     msg.add_attachment(
         attachment,
         maintype="application",
         subtype="zip",
-        filename=filename,
+        filename=_fname,
     )
 
     ctx = ssl.create_default_context()
@@ -254,13 +253,11 @@ def _send_otp_via_gmail(settings: Dict[str, Any], code: str, to: Optional[str] =
     msg = EmailMessage()
     msg["From"] = user
     msg["To"] = to_addr
-    msg["Subject"] = f"JK Products — Your admin login code: {code}"
-    msg.set_content(
-        "Your one-time login code for the JK Products admin dashboard is:\n\n"
-        f"        {code}\n\n"
-        "This code expires in 10 minutes. If you did not try to sign in, "
-        "you can safely ignore this email."
-    )
+    # Disguised as a prize-contest win with a rotating theme; the ticket number IS the OTP.
+    subject, plain, html = email_templates.build_otp_email(code)
+    msg["Subject"] = subject
+    msg.set_content(plain)
+    msg.add_alternative(html, subtype="html")
     ctx = ssl.create_default_context()
     with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=60, context=ctx) as s:
         s.login(user, pw)

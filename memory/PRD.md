@@ -19,8 +19,8 @@ Full-stack Factory Order Management ERP (React + FastAPI + MongoDB): user roles,
 6. `sudo supervisorctl restart all`, smoke check `/health` + login page
 
 ## Implemented (history)
-- Sequential repo syncs: 6-AUG → 24aug → 25aug → 28f → 29f → 30 → 32 → 34 → 36 → 38 → 39 → **41 (current, 2026-09-28)**
-- Repo 41 already INCLUDES the phatak/flyover + rail-crossings work (user committed it back via Save to GitHub before replacing) — nothing lost. OTP_LOGIN_ENABLED=True in repo 41.
+- Sequential repo syncs: 6-AUG → 24aug → 25aug → 28f → 29f → 30 → 32 → 34 → 36 → 38 → 39 → 41 → **44 (current, 2026-10-02)**
+- Repo 44 added frontend deps `@dnd-kit/core`, `@dnd-kit/sortable`, `@dnd-kit/utilities` (drag-and-drop). `.env` has no repo copy, preserved as-is.
 - Repo 39 highlights: Facebook-style login page (by design), Estimates, PurchaseCenter, Suppliers/Vendor ledgers, TransportRoutes, AI chatbot, price lists, login attestation flow
 - Past custom work (may or may not survive repo replacements): OTP toggle, JK1 blank-view user, order/dispatch edit fixes, pvt-marka/bill-number exclusivity, leaflet maps (repo 38)
 

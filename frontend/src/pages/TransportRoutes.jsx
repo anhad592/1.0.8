@@ -13,10 +13,48 @@ import { toast } from "sonner";
 import {
   MapPin, Factory, Plus, Trash2, Route as RouteIcon, Save, Loader2, ListChecks,
   Map as MapIcon, Satellite, Pencil, Check, X, Crosshair, Truck, Navigation, Copy, ExternalLink, Search,
-  Package, CalendarDays, Printer, TrainFront, Milestone,
+  Package, CalendarDays, Printer, TrainFront, Milestone, AlertTriangle,
 } from "lucide-react";
 import DatePicker from "@/components/DatePicker";
 import { todayIso } from "@/lib/dates";
+import {
+  DndContext, closestCenter, PointerSensor, TouchSensor, KeyboardSensor, useSensor, useSensors,
+} from "@dnd-kit/core";
+import {
+  SortableContext, verticalListSortingStrategy, useSortable, arrayMove, sortableKeyboardCoordinates,
+} from "@dnd-kit/sortable";
+import { CSS } from "@dnd-kit/utilities";
+import { GripVertical } from "lucide-react";
+
+// Drag-to-reorder row wrapper. Only the grip handle starts a drag so the
+// checkbox / edit / delete buttons keep working normally.
+function SortableTransportRow({ id, disabled, className, children, ...rest }) {
+  const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({ id, disabled });
+  const style = {
+    transform: CSS.Transform.toString(transform),
+    transition,
+    zIndex: isDragging ? 20 : undefined,
+    position: "relative",
+  };
+  return (
+    <div ref={setNodeRef} style={style}
+         className={`${className} ${isDragging ? "shadow-lg ring-2 ring-[#E65100] opacity-95" : ""}`} {...rest}>
+      <button
+        type="button"
+        {...attributes}
+        {...listeners}
+        disabled={disabled}
+        aria-label="Drag to reorder"
+        title={disabled ? "Search clear karo to reorder" : "Drag karke serial number badlo"}
+        className={`mt-0.5 -ml-1 p-0.5 rounded-sm touch-none ${disabled ? "text-slate-300 cursor-not-allowed" : "text-slate-400 hover:text-[#E65100] hover:bg-orange-50 cursor-grab active:cursor-grabbing"}`}
+        data-testid={`tr-drag-${id}`}
+      >
+        <GripVertical className="w-4 h-4" />
+      </button>
+      {children}
+    </div>
+  );
+}
 
 // Marker icon default asset shim (react-leaflet's defaults 404 without this).
 delete L.Icon.Default.prototype._getIconUrl;
@@ -172,7 +210,7 @@ function ClickToPick({ enabled, onPick }) {
   return null;
 }
 
-const emptyDraft = { name: "", lat: "", lng: "" };
+const emptyDraft = { name: "", lat: "", lng: "", serial: "" };
 
 // Build a Google Maps directions URL that opens the app on mobile (or the
 // web version on desktop) and pre-fills factory → waypoints → last stop.
@@ -203,8 +241,11 @@ function buildGoogleMapsUrl(factory, orderedStops) {
 // render a single marker per group and show the underlying names.
 function clusterByLocation(items, precision = 4) {
   if (!Array.isArray(items) || items.length === 0) return [];
+  // Skip transports that have no coordinate yet (needs_location) — they can't
+  // be placed on the map until the user sets their location.
+  const placeable = items.filter((it) => it && it.lat != null && it.lng != null);
   const groups = new Map();
-  items.forEach((it, idx) => {
+  placeable.forEach((it, idx) => {
     const key = `${Number(it.lat).toFixed(precision)},${Number(it.lng).toFixed(precision)}`;
     if (!groups.has(key)) groups.set(key, []);
     groups.get(key).push({ ...it, _idx: idx });
@@ -216,6 +257,16 @@ function clusterByLocation(items, precision = 4) {
     items: arr,
   }));
 }
+
+// Sort transports by their master-list serial (ascending). Transports without
+// a serial (not in the uploaded list) sort AFTER, alphabetically by name.
+function bySerial(a, b) {
+  const sa = typeof a.serial === "number" ? a.serial : Infinity;
+  const sb = typeof b.serial === "number" ? b.serial : Infinity;
+  if (sa !== sb) return sa - sb;
+  return (a.name || "").localeCompare(b.name || "");
+}
+
 
 export default function TransportRoutes() {
   const [factory, setFactory] = useState({ lat: 30.8978257, lng: 75.8528076, label: "JK Products Factory" });
@@ -498,9 +549,53 @@ export default function TransportRoutes() {
     }
   };
 
+  // Re-fetch after add/edit/delete: inserting or moving a serial shifts others.
+  const refreshTransports = async () => {
+    try {
+      const r = await api.get("/transports");
+      setTransports((r.data || []).slice().sort(bySerial));
+    } catch { /* keep current list */ }
+  };
+  const dndSensors = useSensors(
+    useSensor(PointerSensor, { activationConstraint: { distance: 5 } }),
+    useSensor(TouchSensor, { activationConstraint: { delay: 150, tolerance: 6 } }),
+    useSensor(KeyboardSensor, { coordinateGetter: sortableKeyboardCoordinates }),
+  );
+  const onTransportDragEnd = async ({ active, over }) => {
+    if (!over || active.id === over.id) return;
+    const moved = transports.find((t) => t.id === active.id);
+    const target = transports.find((t) => t.id === over.id);
+    if (!moved || !target) return;
+    const maxSerial = transports.reduce((m, t) => (typeof t.serial === "number" && t.serial > m ? t.serial : m), 0);
+    const newSerial = typeof target.serial === "number" ? target.serial : maxSerial + (typeof moved.serial === "number" ? 0 : 1);
+    // Optimistic: reorder locally and renumber the serialised block 1..N.
+    const oldIdx = transports.findIndex((t) => t.id === active.id);
+    const newIdx = transports.findIndex((t) => t.id === over.id);
+    const prevList = transports;
+    const reordered = arrayMove(transports, oldIdx, newIdx);
+    const serialCount = maxSerial + (typeof moved.serial === "number" ? 0 : 1);
+    setTransports(reordered.map((t, i) => (i < serialCount ? { ...t, serial: i + 1 } : t)));
+    try {
+      const r = await api.patch(`/transports/${moved.id}`, { name: moved.name, serial: newSerial });
+      toast.success(`"${moved.name}" ab serial #${r.data.serial} par hai.`);
+    } catch (e) {
+      setTransports(prevList);
+      toast.error(e?.response?.data?.detail || "Could not reorder");
+    } finally {
+      refreshTransports();
+    }
+  };
+  const nextSerial = transports.reduce(
+    (m, t) => (typeof t.serial === "number" && t.serial > m ? t.serial : m), 0) + 1;
+
   const addTransport = async () => {
     const name = draft.name.trim();
     if (!name) { toast.error("Enter a transport name."); return; }
+    const serialNum = String(draft.serial).trim() === "" ? nextSerial : Number(draft.serial);
+    if (!Number.isInteger(serialNum) || serialNum < 1) {
+      toast.error("Enter a valid serial number (1, 2, 3…).");
+      return;
+    }
     if (!isValidLatLng(draft.lat, draft.lng)) {
       toast.error("Enter valid coordinates or click on the map.");
       return;
@@ -508,12 +603,12 @@ export default function TransportRoutes() {
     try {
       setBusy((b) => ({ ...b, adding: true }));
       const r = await api.post("/transports", {
-        name, lat: Number(draft.lat), lng: Number(draft.lng),
+        name, lat: Number(draft.lat), lng: Number(draft.lng), serial: serialNum,
       });
-      setTransports((prev) => [...prev, r.data].sort((a, b) => a.name.localeCompare(b.name)));
+      await refreshTransports();
       setDraft({ ...emptyDraft });
       setPickMode(false);
-      toast.success(`Added "${r.data.name}".`);
+      toast.success(`Added "${r.data.name}" at serial #${r.data.serial}.`);
     } catch (e) {
       toast.error(e?.response?.data?.detail || "Could not add transport");
     } finally {
@@ -523,7 +618,12 @@ export default function TransportRoutes() {
 
   const startEdit = (t) => {
     setEditingId(t.id);
-    setEditingDraft({ name: t.name, lat: String(t.lat), lng: String(t.lng) });
+    setEditingDraft({
+      name: t.name,
+      serial: typeof t.serial === "number" ? String(t.serial) : "",
+      lat: t.lat != null ? String(t.lat) : "",
+      lng: t.lng != null ? String(t.lng) : "",
+    });
   };
   const cancelEdit = () => { setEditingId(null); setEditingDraft({ ...emptyDraft }); };
   const saveEdit = async () => {
@@ -533,12 +633,17 @@ export default function TransportRoutes() {
       toast.error("Enter valid coordinates.");
       return;
     }
+    const es = String(editingDraft.serial ?? "").trim();
+    if (es !== "" && (!Number.isInteger(Number(es)) || Number(es) < 1)) {
+      toast.error("Enter a valid serial number (1, 2, 3…).");
+      return;
+    }
     try {
-      const r = await api.patch(`/transports/${editingId}`, {
+      await api.patch(`/transports/${editingId}`, {
         name: nm, lat: Number(editingDraft.lat), lng: Number(editingDraft.lng),
+        ...(es !== "" ? { serial: Number(es) } : {}),
       });
-      setTransports((prev) => prev.map((t) => (t.id === editingId ? r.data : t))
-        .sort((a, b) => a.name.localeCompare(b.name)));
+      await refreshTransports();
       toast.success("Updated.");
       cancelEdit();
     } catch (e) {
@@ -550,7 +655,7 @@ export default function TransportRoutes() {
     if (!window.confirm(`Delete transport "${t.name}"?`)) return;
     try {
       await api.delete(`/transports/${t.id}`);
-      setTransports((prev) => prev.filter((x) => x.id !== t.id));
+      await refreshTransports();
       setSelected((prev) => { const n = { ...prev }; delete n[t.id]; return n; });
       toast.success("Deleted");
     } catch (e) {
@@ -563,7 +668,9 @@ export default function TransportRoutes() {
     if (on) next[id] = true; else delete next[id];
     return next;
   });
-  const selectAll = () => setSelected(Object.fromEntries(transports.map((t) => [t.id, true])));
+  const selectAll = () => setSelected(Object.fromEntries(
+    transports.filter((t) => !t.needs_location && t.lat != null && t.lng != null).map((t) => [t.id, true])
+  ));
   const clearSelection = () => setSelected({});
 
   const orderedStops = useMemo(() => {
@@ -590,7 +697,8 @@ export default function TransportRoutes() {
 
   const mapPoints = useMemo(() => {
     if (selectedTransports.length > 0) return [factory, ...selectedTransports];
-    if (transports.length > 0) return [factory, ...transports];
+    const placeable = transports.filter((t) => t.lat != null && t.lng != null);
+    if (placeable.length > 0) return [factory, ...placeable];
     return [factory];
   }, [factory, transports, selectedTransports]);
 
@@ -662,16 +770,35 @@ export default function TransportRoutes() {
               <Crosshair className="w-3.5 h-3.5" /> {pickMode ? "Picking… click map" : "Pick on map"}
             </button>
           </div>
-          <div>
-            <Label className="text-xs font-bold uppercase">Transport name</Label>
-            <Input
-              value={draft.name}
-              onChange={(e) => setDraft((d) => ({ ...d, name: e.target.value }))}
-              placeholder="e.g. Sharma Transport"
-              className="h-10 rounded-sm mt-1"
-              data-testid="tr-name"
-            />
+          <div className="grid grid-cols-[1fr_120px] gap-3">
+            <div>
+              <Label className="text-xs font-bold uppercase">Transport name</Label>
+              <Input
+                value={draft.name}
+                onChange={(e) => setDraft((d) => ({ ...d, name: e.target.value }))}
+                placeholder="e.g. Sharma Transport"
+                className="h-10 rounded-sm mt-1"
+                data-testid="tr-name"
+              />
+            </div>
+            <div>
+              <Label className="text-xs font-bold uppercase">Serial no.</Label>
+              <Input
+                type="number"
+                min={1}
+                max={nextSerial}
+                value={draft.serial}
+                onChange={(e) => setDraft((d) => ({ ...d, serial: e.target.value }))}
+                placeholder={String(nextSerial)}
+                className="h-10 rounded-sm mt-1 font-mono-num"
+                data-testid="tr-serial"
+              />
+            </div>
           </div>
+          <p className="text-[11px] text-slate-500 mt-1" data-testid="tr-serial-hint">
+            Kis serial number par add karna hai? Khaali chhodne par <b>#{nextSerial}</b> (last) par add hoga.
+            Pehle se bhara number doge toh baaki transports ek number aage khisak jayenge.
+          </p>
           <div className="grid grid-cols-2 gap-3 mt-3">
             <div>
               <Label className="text-xs font-bold uppercase">Latitude</Label>
@@ -762,6 +889,12 @@ export default function TransportRoutes() {
                   </button>
                 )}
               </div>
+              <p className="text-[11px] text-slate-500 mb-1.5 flex items-center gap-1" data-testid="tr-drag-hint">
+                <GripVertical className="w-3 h-3" />
+                {searchQ.trim() ? "Reorder karne ke liye search clear karo." : "Upar-neeche drag karke serial number badlo."}
+              </p>
+              <DndContext sensors={dndSensors} collisionDetection={closestCenter} onDragEnd={onTransportDragEnd}>
+              <SortableContext items={filteredTransports.map((t) => t.id)} strategy={verticalListSortingStrategy}>
               <div className="space-y-1.5 max-h-80 overflow-auto pr-1" data-testid="tr-list">
                 {filteredTransports.length === 0 ? (
                   <div className="text-sm text-slate-400 text-center py-6" data-testid="tr-search-empty">
@@ -769,21 +902,35 @@ export default function TransportRoutes() {
                   </div>
                 ) : filteredTransports.map((t) => {
                 const isEditing = editingId === t.id;
+                const noLoc = !!t.needs_location || t.lat == null || t.lng == null;
                 return (
-                  <div
+                  <SortableTransportRow
                     key={t.id}
-                    className="flex items-start gap-2 border border-slate-200 rounded-sm px-2.5 py-2 bg-slate-50"
+                    id={t.id}
+                    disabled={!!searchQ.trim() || !!editingId}
+                    className={`flex items-start gap-2 border rounded-sm px-2.5 py-2 ${noLoc ? "border-red-300 bg-red-50" : "border-slate-200 bg-slate-50"}`}
                     data-testid={`tr-row-${t.id}`}
+                    data-needs-location={noLoc ? "yes" : "no"}
                   >
                     <Checkbox
                       checked={!!selected[t.id]}
+                      disabled={noLoc}
                       onCheckedChange={(v) => toggleSelect(t.id, !!v)}
-                      className="mt-1 data-[state=checked]:bg-[#E65100] data-[state=checked]:border-[#E65100]"
+                      className="mt-1 data-[state=checked]:bg-[#E65100] data-[state=checked]:border-[#E65100] disabled:opacity-40"
                       data-testid={`tr-check-${t.id}`}
                     />
                     <div className="flex-1 min-w-0">
                       {isEditing ? (
-                        <div className="grid grid-cols-1 sm:grid-cols-3 gap-1.5">
+                        <div className="grid grid-cols-1 sm:grid-cols-[64px_1fr_1fr_1fr] gap-1.5">
+                          <Input
+                            type="number"
+                            min={1}
+                            value={editingDraft.serial ?? ""}
+                            placeholder="S.No"
+                            onChange={(e) => setEditingDraft((d) => ({ ...d, serial: e.target.value }))}
+                            className="h-8 rounded-sm text-sm font-mono-num"
+                            data-testid="tr-edit-serial"
+                          />
                           <Input
                             value={editingDraft.name}
                             onChange={(e) => setEditingDraft((d) => ({ ...d, name: e.target.value }))}
@@ -791,21 +938,37 @@ export default function TransportRoutes() {
                           />
                           <Input
                             value={editingDraft.lat}
+                            placeholder="lat"
                             onChange={(e) => setEditingDraft((d) => ({ ...d, lat: e.target.value }))}
                             className="h-8 rounded-sm text-sm font-mono-num"
                           />
                           <Input
                             value={editingDraft.lng}
+                            placeholder="lng"
                             onChange={(e) => setEditingDraft((d) => ({ ...d, lng: e.target.value }))}
                             className="h-8 rounded-sm text-sm font-mono-num"
                           />
                         </div>
                       ) : (
                         <>
-                          <div className="text-sm font-bold text-slate-900 truncate">{t.name}</div>
-                          <div className="text-[11px] text-slate-500 font-mono-num">
-                            {Number(t.lat).toFixed(4)}, {Number(t.lng).toFixed(4)}
+                          <div className="text-sm font-bold text-slate-900 truncate flex items-center gap-1.5">
+                            {typeof t.serial === "number" && (
+                              <span className="shrink-0 inline-flex items-center justify-center min-w-[22px] h-[18px] px-1 rounded-sm bg-slate-900 text-white text-[10px] font-black font-mono-num">
+                                {t.serial}
+                              </span>
+                            )}
+                            <span className="truncate">{t.name}</span>
                           </div>
+                          {noLoc ? (
+                            <div className="text-[11px] font-bold text-red-600 flex items-center gap-1">
+                              <AlertTriangle className="w-3 h-3" />
+                              Location missing — click edit to set
+                            </div>
+                          ) : (
+                            <div className="text-[11px] text-slate-500 font-mono-num">
+                              {Number(t.lat).toFixed(4)}, {Number(t.lng).toFixed(4)}
+                            </div>
+                          )}
                         </>
                       )}
                     </div>
@@ -830,10 +993,12 @@ export default function TransportRoutes() {
                         </>
                       )}
                     </div>
-                  </div>
+                  </SortableTransportRow>
                 );
               })}
               </div>
+              </SortableContext>
+              </DndContext>
             </>
           )}
 
