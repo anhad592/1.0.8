@@ -45,6 +45,26 @@ logger = logging.getLogger(__name__)
 LINE_CLEAR_THRESHOLD = 0.85
 
 
+async def log_order_activity(order_id: str, action: str, by: Optional[str] = None,
+                             items: Optional[List[Dict[str, Any]]] = None,
+                             slip_no: Optional[int] = None, note: str = "") -> None:
+    if not order_id:
+        return
+    await db.order_activity.insert_one({
+        "id": str(uuid.uuid4()), "order_id": order_id, "action": action,
+        "by": by or "system", "at": now_iso(), "slip_no": slip_no, "note": note,
+        "items": [{"item_name": it.get("item_name") or it.get("product_name") or "",
+                   "quantity": int(it.get("quantity") or 0)} for it in (items or [])],
+    })
+
+
+async def _log_alloc(alloc: Dict[str, Dict[str, int]], lines: List[Dict[str, Any]], by: str,
+                     slip_no: Optional[int], action: str = "slip_linked") -> None:
+    names = {li.get("item_id"): li.get("item_name") or li.get("product_name") for li in lines}
+    for oid, m in (alloc or {}).items():
+        await log_order_activity(oid, action, by, [{"item_name": names.get(i) or i, "quantity": q} for i, q in m.items()], slip_no)
+
+
 def _apply_line_clear_threshold(
     order_items: List[Dict[str, Any]],
     dispatched_map: Dict[str, int],
@@ -263,6 +283,7 @@ class OrderItemIn(BaseModel):
     # Strict item-wise: every order line MUST identify a specific SKU.
     item_id: str
     item_name: str
+    rate: Optional[float] = None  # agreed net price/pc (e.g. from an estimate)
 
 
 class OrderIn(BaseModel):
@@ -273,6 +294,8 @@ class OrderIn(BaseModel):
     notes: Optional[str] = ""
     merge_with_pending: bool = False
     clear_previous_pending: bool = False
+    estimate_id: Optional[str] = None
+    estimate_no: Optional[int] = None
 
 
 class OrderStatusUpdate(BaseModel):
@@ -1976,6 +1999,7 @@ async def create_order(body: OrderIn, user=Depends(require_action("add:orders"))
                           "delivery_date": body.delivery_date or existing.get("delivery_date"),
                           "notes": (existing.get("notes", "") + " | " + (body.notes or "")).strip(" |")}},
             )
+            await log_order_activity(existing["id"], "items_added", user["email"], [it.model_dump() for it in body.items])
             await _persist_customer_prefs(body.customer_id, body.items)
             return await db.orders.find_one({"id": existing["id"]}, {"_id": 0})
 
@@ -1991,11 +2015,14 @@ async def create_order(body: OrderIn, user=Depends(require_action("add:orders"))
         "created_by": user["email"],
         "created_at": now_iso(),
         "updated_at": now_iso(),
+        "estimate_id": body.estimate_id,
+        "estimate_no": body.estimate_no,
     }
     await db.orders.insert_one(doc)
+    await log_order_activity(doc["id"], "created", user["email"], doc["items"])
     await _persist_customer_prefs(body.customer_id, body.items)
-    doc.pop("_id", None)
-    return doc
+    await _reconcile_customer_orders(body.customer_id, actor=user["email"])
+    return await db.orders.find_one({"id": doc["id"]}, {"_id": 0})
 
 
 @api_router.get("/orders")
@@ -2051,12 +2078,22 @@ async def list_orders(status_filter: Optional[str] = None, user=Depends(get_curr
     # Track which dispatch ids are already linked to each order so the
     # inference step below doesn't attach a slip that's already shown.
     linked_disp_ids: Dict[str, set] = {}
+    undo_map: Dict[str, Dict[str, Any]] = {}
+    if order_ids:
+        async for u in db.discrepancy_undo.find(
+            {"order_id": {"$in": order_ids}}, {"_id": 0, "order_id": 1, "action": 1, "at": 1, "by": 1}
+        ):
+            undo_map[u["order_id"]] = {"action": u["action"], "at": u["at"], "by": u.get("by")}
+    order_skus: Dict[str, set] = {
+        o["id"]: {it.get("item_id") for it in (o.get("items") or []) + (o.get("original_items") or []) if it.get("item_id")}
+        for o in items
+    }
     if order_ids:
         oid_set = set(order_ids)
         async for d in db.dispatches.find(
             {"$or": [{"order_id": {"$in": order_ids}}, {"order_ids": {"$in": order_ids}}]},
             {"_id": 0, "id": 1, "order_id": 1, "order_ids": 1, "items": 1,
-             "dispatched_at": 1, "last_dispatched_at": 1, "slip_no": 1},
+             "dispatched_at": 1, "last_dispatched_at": 1, "slip_no": 1, "order_alloc": 1},
         ):
             targets = []
             if d.get("order_id") in oid_set:
@@ -2080,8 +2117,15 @@ async def list_orders(status_filter: Optional[str] = None, user=Depends(get_curr
                 "quantity": int(it.get("quantity") or 0),
             } for it in (d.get("items") or [])]
             for oid in targets:
+                alloc = (d.get("order_alloc") or {}).get(oid)
+                if alloc:
+                    grp_items = [{**it, "quantity": int(alloc[it["item_id"]])}
+                                 for it in slip_items if it.get("item_id") in alloc]
+                else:
+                    known = order_skus.get(oid) or set()
+                    grp_items = [it for it in slip_items if it.get("item_id") in known] or slip_items
                 bucket = disp_map.setdefault(oid, {})
-                for it in slip_items:
+                for it in grp_items:
                     key = it.get("item_id") or it.get("item_name") or ""
                     row = bucket.setdefault(key, {
                         "item_id": it.get("item_id"),
@@ -2092,7 +2136,8 @@ async def list_orders(status_filter: Optional[str] = None, user=Depends(get_curr
                     })
                     row["quantity"] += it["quantity"]
                 disp_slips.setdefault(oid, []).append({
-                    "date": day, "slip_no": d.get("slip_no"), "items": slip_items,
+                    "date": day, "slip_no": d.get("slip_no"), "items": grp_items,
+                    "pcs": sum(it["quantity"] for it in grp_items),
                 })
                 linked_disp_ids.setdefault(oid, set()).add(d.get("id"))
 
@@ -2140,7 +2185,10 @@ async def list_orders(status_filter: Optional[str] = None, user=Depends(get_curr
         o["customer_city"] = loc.get("city", "")
         o["customer_location"] = loc.get("location", "")
         o["customer_address"] = loc.get("address", "")
+        o["discrepancy_undo"] = undo_map.get(o["id"])
         o["dispatched_items"] = list(disp_map.get(o["id"], {}).values())
+        o["completed_pcs"] = sum(int(it.get("quantity") or 0) for it in o["dispatched_items"])
+        o["pending_pcs"] = sum(int(it.get("quantity") or 0) for it in (o.get("items") or []))
         # Per-slip brief: [{date, slip_no, items:[...]}, ...] sorted oldest→newest.
         slips = sorted(disp_slips.get(o["id"], []), key=lambda s: (s.get("date") or ""))
         o["dispatch_summary"] = slips
@@ -2251,6 +2299,7 @@ async def update_order_status(oid: str, body: OrderStatusUpdate, user=Depends(re
     res = await db.orders.update_one({"id": oid}, {"$set": {"status": body.status, "updated_at": now_iso()}})
     if res.matched_count == 0:
         raise HTTPException(status_code=404, detail="Order not found")
+    await log_order_activity(oid, "status_changed", user["email"], note=body.status)
     return await db.orders.find_one({"id": oid}, {"_id": 0})
 
 
@@ -2276,7 +2325,8 @@ async def admin_update_order(oid: str, body: OrderUpdate, admin=Depends(require_
         missing = [iid for iid in item_ids if iid not in found_ids]
         if missing:
             raise HTTPException(status_code=400, detail=f"Unknown item_id(s): {missing}")
-        update["items"] = [it.model_dump() for it in body.items]
+        old_rates = {i.get("item_id"): i.get("rate") for i in (existing.get("items") or []) + (existing.get("original_items") or []) if i.get("rate") is not None}
+        update["items"] = [{**it.model_dump(), "rate": it.rate if it.rate is not None else old_rates.get(it.item_id)} for it in body.items]
     if body.order_date is not None:
         update["order_date"] = body.order_date
     if body.delivery_date is not None:
@@ -2291,6 +2341,9 @@ async def admin_update_order(oid: str, body: OrderUpdate, admin=Depends(require_
         raise HTTPException(status_code=400, detail="No fields to update")
     update["updated_at"] = now_iso()
     await db.orders.update_one({"id": oid}, {"$set": update})
+    changed = [k for k in ("customer_id", "items", "order_date", "delivery_date", "notes", "status") if k in update]
+    await log_order_activity(oid, "edited", admin["email"], update.get("items"), note=", ".join(changed))
+    await _reconcile_customer_orders(update.get("customer_id") or existing.get("customer_id"), actor=admin["email"])
     return await db.orders.find_one({"id": oid}, {"_id": 0})
 
 
@@ -2299,6 +2352,7 @@ async def delete_order(oid: str, user=Depends(require_action("delete:orders"))):
     res = await db.orders.delete_one({"id": oid})
     if res.deleted_count == 0:
         raise HTTPException(status_code=404, detail="Order not found")
+    await log_order_activity(oid, "deleted", user["email"])
     return {"ok": True}
 
 
@@ -2332,6 +2386,19 @@ async def resolve_discrepancy(oid: str, body: DiscrepancyResolveIn,
     need = "delete:orders" if action == "delete" else "edit:orders"
     if not has_action_permission(user, need):
         raise HTTPException(status_code=403, detail="You don't have permission for this action.")
+
+    disp_before = None
+    if body.dispatch_id and action == "clear":
+        disp_before = await db.dispatches.find_one(
+            {"id": body.dispatch_id}, {"_id": 0, "order_ids": 1, "order_fully_dispatched": 1, "updated_at": 1})
+    await db.discrepancy_undo.delete_many({"order_id": oid})
+    await db.discrepancy_undo.insert_one({
+        "order_id": oid, "action": action, "at": now_iso(),
+        "by": user.get("email") or user.get("username") or "",
+        "order_before": order, "dispatch_id": body.dispatch_id, "dispatch_before": disp_before,
+    })
+    _slip = (await db.dispatches.find_one({"id": body.dispatch_id}, {"_id": 0, "slip_no": 1}) or {}).get("slip_no") if body.dispatch_id else None
+    await log_order_activity(oid, f"discrepancy_{action}", user.get("email"), slip_no=_slip)
 
     if action == "delete":
         await db.orders.delete_one({"id": oid})
@@ -2406,6 +2473,154 @@ async def resolve_discrepancy(oid: str, body: DiscrepancyResolveIn,
     return {"ok": True, "action": action,
             "fully_dispatched": fully_dispatched,
             "order": await db.orders.find_one({"id": oid}, {"_id": 0})}
+
+
+def _parse_iso(s):
+    if not s:
+        return None
+    try:
+        d = datetime.fromisoformat(str(s).replace("Z", "+00:00")) if isinstance(s, str) else s
+        return d if d.tzinfo else d.replace(tzinfo=timezone.utc)
+    except Exception:
+        return None
+
+
+class DiscResyncIn(BaseModel):
+    order_ids: Optional[List[str]] = None  # restrict apply to these orders
+
+
+@api_router.post("/orders/discrepancy-resync")
+async def discrepancy_resync(dry_run: bool = True,
+                             body: Optional[DiscResyncIn] = None, admin=Depends(require_admin)):
+    """Re-check every 'Possible timing discrepancy' AND deep-scan for ones the
+    warning missed (slips older than the warning window, or other unlinked
+    slips) whose qty is still free. Free slip qty → applied (clear); flagged
+    but already used by another order → false alarm (keep). All undoable."""
+    pend = await list_orders(status_filter="Pending", user=admin)
+    deep_days = int((await _get_settings_doc()).get("discrepancy_window_days", 2))
+    cands: Dict[str, Dict[str, Any]] = {}
+    for o in pend:
+        if o.get("discrepancy"):
+            d = o["discrepancy"]
+            cands[o["id"]] = {"o": o, "slips": {d["dispatch_id"]: d}, "missed": False}
+    disp_cache: Dict[str, List[Dict[str, Any]]] = {}
+    for o in pend:
+        if o.get("discrepancy_dismissed") and o["id"] not in cands:
+            continue
+        entered = _parse_iso(o.get("created_at"))
+        oday = str(o.get("order_date") or o.get("created_at") or "")[:10]
+        skus = {it.get("item_id") for it in (o.get("items") or []) if it.get("item_id")}
+        if not entered or not skus:
+            continue
+        cid = o.get("customer_id") or ""
+        if cid not in disp_cache:
+            disp_cache[cid] = await db.dispatches.find(
+                {"customer_id": cid}, {"_id": 0, "id": 1, "slip_no": 1, "dispatched_at": 1, "items": 1, "order_id": 1, "order_ids": 1}
+            ).to_list(5000)
+        found: Dict[str, Any] = {}
+        for d in disp_cache[cid]:
+            if d.get("order_id") == o["id"] or o["id"] in (d.get("order_ids") or []):
+                continue
+            ddt = _parse_iso(d.get("dispatched_at"))
+            if not ddt or not (ddt < entered) or (entered - ddt) > timedelta(days=deep_days):
+                continue
+            if str(d.get("dispatched_at") or "")[:10] >= oday:
+                continue  # normal resync already covers slips on/after the order date
+            if any(li.get("item_id") in skus for li in (d.get("items") or [])):
+                found[d["id"]] = {"dispatch_id": d["id"], "slip_no": d.get("slip_no"), "dispatched_at": d.get("dispatched_at")}
+        if o["id"] in cands:
+            cands[o["id"]]["slips"].update(found)  # every slip in the window, not just the latest
+        elif found:
+            cands[o["id"]] = {"o": o, "slips": found, "missed": True}
+
+    if body and body.order_ids is not None:
+        keep_ids = set(body.order_ids)
+        cands = {k: v for k, v in cands.items() if k in keep_ids}
+    by_cust: Dict[str, List[Dict[str, Any]]] = {}
+    for c in cands.values():
+        by_cust.setdefault(c["o"].get("customer_id") or "", []).append(c)
+    who = admin.get("email") or ""
+    out: List[Dict[str, Any]] = []
+    for cid, group in by_cust.items():
+        allow = {c["o"]["id"]: set(c["slips"].keys()) for c in group}
+        if not dry_run:
+            for c in group:
+                c["raw"] = await db.orders.find_one({"id": c["o"]["id"]}, {"_id": 0})
+                c["dsp"] = await db.dispatches.find(
+                    {"id": {"$in": list(c["slips"].keys())}}, {"_id": 0, "id": 1, "order_ids": 1, "order_fully_dispatched": 1}
+                ).to_list(100)
+        ch = await _reconcile_customer_orders(cid, apply=not dry_run, actor=who, allow_before=allow)
+        chmap = {x["order_id"]: x for x in ch}
+        for c in group:
+            o = c["o"]
+            res = chmap.get(o["id"])
+            if c["missed"] and not res:
+                continue  # older slip already used elsewhere → not a real discrepancy
+            action = "clear" if res else "keep"
+            first = sorted(c["slips"].values(), key=lambda x: str(x.get("dispatched_at") or ""))[-1]
+            used = (res or {}).get("slip_lines") or []
+            pend_now = sum(int(i.get("quantity") or 0) for i in (o.get("items") or []))
+            out.append({
+                "order_id": o["id"], "customer_name": o.get("customer_name"), "missed": c["missed"],
+                "order_date": str(o.get("order_date") or "")[:10], "entered_at": o.get("created_at"),
+                "slip_no": used[0]["slip_no"] if used else first.get("slip_no"),
+                "dispatched_at": used[0]["date"] if used else first.get("dispatched_at"),
+                "action": action, "slip_lines": used,
+                "pending_before": pend_now, "pending_after": (res or {}).get("pending_after", pend_now),
+                "new_status": (res or {}).get("new_status", "Pending"),
+            })
+            if dry_run:
+                continue
+            await db.discrepancy_undo.delete_many({"order_id": o["id"]})
+            await db.discrepancy_undo.insert_one({
+                "order_id": o["id"], "action": action, "at": now_iso(), "by": who,
+                "order_before": c["raw"], "dispatch_id": None, "dispatch_before": None,
+                "dispatches_before": c["dsp"] if action == "clear" else [],
+            })
+            await db.orders.update_one({"id": o["id"]}, {"$set": {"discrepancy_dismissed": True}})
+            await log_order_activity(o["id"], f"discrepancy_{action}", who,
+                                     slip_no=used[0]["slip_no"] if used else first.get("slip_no"),
+                                     note="resync (missed)" if c["missed"] else "resync")
+    out.sort(key=lambda x: (not x["missed"], x["action"] != "clear"))
+    return {
+        "dry_run": dry_run, "count": len(out), "changes": out,
+        "to_clear": sum(1 for c in out if c["action"] == "clear"),
+        "to_keep": sum(1 for c in out if c["action"] == "keep"),
+        "missed": sum(1 for c in out if c["missed"]),
+        "total_pcs": sum(sum(sum(i["quantity"] for i in sl["items"]) for sl in c["slip_lines"]) for c in out),
+        "checked_at": now_iso(),
+    }
+
+
+@api_router.get("/orders/{oid}/activity")
+async def order_activity(oid: str, user=Depends(get_current_user)):
+    return await db.order_activity.find({"order_id": oid}, {"_id": 0}).sort("at", -1).to_list(500)
+
+
+@api_router.post("/orders/{oid}/undo-discrepancy")
+async def undo_discrepancy(oid: str, user=Depends(require_action("edit:orders"))):
+    """Revert the last discrepancy resolution (clear / update_date / keep / delete)."""
+    entry = await db.discrepancy_undo.find_one({"order_id": oid}, {"_id": 0})
+    if not entry:
+        raise HTTPException(status_code=404, detail="Nothing to undo for this order")
+    before = entry["order_before"]
+    await db.orders.replace_one({"id": oid}, before, upsert=True)
+    for d in entry.get("dispatches_before") or []:
+        await db.dispatches.update_one({"id": d["id"]}, {"$set": {
+            "order_ids": d.get("order_ids") or [],
+            "order_fully_dispatched": bool(d.get("order_fully_dispatched")),
+            "updated_at": now_iso(),
+        }})
+    db_before = entry.get("dispatch_before")
+    if entry.get("dispatch_id") and db_before is not None:
+        await db.dispatches.update_one({"id": entry["dispatch_id"]}, {"$set": {
+            "order_ids": db_before.get("order_ids") or [],
+            "order_fully_dispatched": bool(db_before.get("order_fully_dispatched")),
+            "updated_at": now_iso(),
+        }})
+    await db.discrepancy_undo.delete_many({"order_id": oid})
+    await log_order_activity(oid, "discrepancy_undo", user["email"], note=entry["action"])
+    return {"ok": True, "undone": entry["action"], "order": await db.orders.find_one({"id": oid}, {"_id": 0})}
 
 
 # ======================== Dashboard Summary ========================
@@ -2788,6 +3003,8 @@ async def dispatch_execute(body: DispatchExecuteIn, user=Depends(require_action(
             alloc.item_id,
             line.get("product_name") or "",
         )
+        if line.get("rate") is not None:
+            pricing = {**pricing, "net_unit_price": round(float(line["rate"]), 2), "price_override": True}
         dispatched_lines.append({
             "item_id": alloc.item_id,
             "item_name": line.get("item_name") or line.get("product_name"),
@@ -2899,6 +3116,9 @@ async def dispatch_execute(body: DispatchExecuteIn, user=Depends(require_action(
     # product BOM. Operates only on `dispatched_lines` (the NEW quantities
     # just sent out), so merging into an existing slip doesn't double-deduct.
     await _consume_bom_for_lines(dispatched_lines, dispatch_doc["id"], user.get("email") or "")
+    exec_alloc = {body.order_id: {d["item_id"]: int(d["quantity"]) for d in dispatched_lines}}
+    await db.dispatches.update_one({"id": dispatch_doc["id"]}, {"$inc": _alloc_inc(exec_alloc)})
+    await _log_alloc(exec_alloc, dispatched_lines, user["email"], dispatch_doc.get("slip_no"))
 
     updated_order = await db.orders.find_one({"id": body.order_id}, {"_id": 0})
     return {
@@ -3243,12 +3463,17 @@ async def update_dispatch(did: str, body: DispatchEdit, user=Depends(require_act
     upd: Dict[str, Any] = {"updated_at": now_iso(), "updated_by": user["email"]}
     # Reassign the slip to a different customer (admin can correct a slip
     # punched under the wrong party). The ledger/report follow customer_id.
+    reassigned = False
     if body.customer_id is not None and body.customer_id and body.customer_id != existing.get("customer_id"):
         cust = await db.customers.find_one({"id": body.customer_id}, {"_id": 0})
         if not cust:
             raise HTTPException(status_code=404, detail="Customer not found")
         upd["customer_id"] = cust["id"]
         upd["customer_name"] = cust.get("name") or existing.get("customer_name")
+        # Slip moves to another party: unlink from the old party's orders.
+        upd["order_id"] = None
+        upd["order_ids"] = []
+        reassigned = True
     if body.gr_number is not None:
         upd["gr_number"] = body.gr_number.strip()
     if body.gr_date is not None:
@@ -3289,6 +3514,7 @@ async def update_dispatch(did: str, body: DispatchEdit, user=Depends(require_act
         if new_ts:
             upd["dispatched_at"] = _resolve_dispatch_ts(new_ts)
     restore_lines: List[Dict[str, Any]] = []
+    edit_alloc: Dict[str, Dict[str, int]] = {}
     if body.items is not None:
         new_items: List[Dict[str, Any]] = []
         for it in body.items:
@@ -3351,9 +3577,11 @@ async def update_dispatch(did: str, body: DispatchEdit, user=Depends(require_act
             if iid not in new_by_iid:
                 restore_lines.append({**old_line, "quantity": int(old_line.get("quantity") or 0)})
 
+        if reassigned:
+            add_lines, restore_lines = [], []
         if add_lines:
             extra_touched = await _deduct_off_order_from_pending_orders(
-                existing.get("customer_id"), add_lines
+                existing.get("customer_id"), add_lines, edit_alloc
             )
             if extra_touched:
                 merged_oids = list(existing.get("order_ids") or [])
@@ -3372,11 +3600,21 @@ async def update_dispatch(did: str, body: DispatchEdit, user=Depends(require_act
     # because cumulative dispatch crossed the threshold and the user now
     # reduces the dispatch below it, we must recompute pending from the
     # original_items snapshot, not from the stale per-edit delta.
-    res = await db.dispatches.update_one({"id": did}, {"$set": upd})
+    if reassigned:
+        upd["order_alloc"] = {}
+    ops: Dict[str, Any] = {"$set": upd}
+    if edit_alloc:
+        ops["$inc"] = _alloc_inc(edit_alloc)
+    res = await db.dispatches.update_one({"id": did}, ops)
     if res.matched_count == 0:
         raise HTTPException(status_code=404, detail="Dispatch not found")
-    if body.items is not None and restore_lines:
-        await _restore_dispatch_qty_to_orders(existing, restore_lines)
+    if edit_alloc:
+        await _log_alloc(edit_alloc, upd.get("items") or [], user["email"], existing.get("slip_no"))
+    if reassigned:
+        await _restore_dispatch_qty_to_orders(existing, list(existing.get("items") or []), actor=user["email"], reason="slip_reassigned")
+    elif body.items is not None and restore_lines:
+        await _restore_dispatch_qty_to_orders(existing, restore_lines, actor=user["email"], reason="slip_edited")
+    await _reconcile_customer_orders(upd.get("customer_id") or existing.get("customer_id"), actor=user["email"])
     return await db.dispatches.find_one({"id": did}, {"_id": 0})
 
 
@@ -3405,7 +3643,7 @@ async def delete_dispatch(did: str, admin=Depends(require_action("delete:dispatc
     # the remaining live dispatches when reconstructing pending quantities
     # for lines that were previously auto-cleared by the 85% rule.
     await db.dispatches.delete_one({"id": did})
-    touched_orders = await _restore_dispatch_qty_to_orders(existing, restore_items)
+    touched_orders = await _restore_dispatch_qty_to_orders(existing, restore_items, actor=admin.get("email"), reason="slip_deleted")
     restored_rm = await _revert_bom_consumption_for_dispatch(did, admin.get("email") or "")
 
     # Tombstone — preserve the slip number so a future lookup on this
@@ -3518,6 +3756,8 @@ async def get_dispatch_by_slip(slip_no: int, user=Depends(get_current_user)):
             "location": cust.get("location") or "",
             "transport_name": d.get("transport_name") or cust.get("transport_name") or "",
             "private_mark": cust.get("private_mark") or "",
+            "bill_number_mode": bool(cust.get("bill_number_mode")),
+            "email": cust.get("email") or "",
         },
     }
 
@@ -3575,6 +3815,7 @@ class EstimateItemIn(BaseModel):
     item_id: Optional[str] = None
     item_name: Optional[str] = None      # fallback if item_id missing
     quantity: float
+    price_override: Optional[float] = None  # operator-typed net price per piece
 
 class EstimateIn(BaseModel):
     customer_id: str
@@ -3630,6 +3871,10 @@ async def _compute_estimate(body: EstimateIn) -> Dict[str, Any]:
             })
             continue
         pricing = await compute_line_pricing(price_list_id, item["id"], item.get("product_name") or "")
+        list_net = pricing["net_unit_price"]
+        overridden = row.price_override is not None and row.price_override >= 0
+        if overridden:
+            pricing = {**pricing, "net_unit_price": round(float(row.price_override), 2)}
         line_value = round(pricing["net_unit_price"] * qty, 2)
         line_total += line_value
         lines.append({
@@ -3641,6 +3886,8 @@ async def _compute_estimate(body: EstimateIn) -> Dict[str, Any]:
             "discount_value": pricing["discount_value"],
             "discount_type": pricing["discount_type"],
             "net_unit_price": pricing["net_unit_price"],
+            "list_net_unit_price": list_net,
+            "price_override": overridden,
             "line_value": line_value,
             "found": True,
         })
@@ -3774,9 +4021,39 @@ async def list_estimates(
             "cash_amount": totals.get("cash_amount", 0),
             "price_list_name": d.get("price_list_name"),
             "created_at": d.get("created_at"),
+            "order_id": d.get("order_id"),
             "created_by": d.get("created_by"),
         })
     return {"estimates": out, "count": len(out)}
+
+
+class EstimateToOrderIn(BaseModel):
+    merge_with_pending: bool = False
+    notes: Optional[str] = ""
+
+
+@api_router.post("/estimates/{eid}/convert-to-order")
+async def convert_estimate_to_order(eid: str, body: EstimateToOrderIn,
+                                    user=Depends(require_action("add:orders"))):
+    est = await db.estimates.find_one({"id": eid}, {"_id": 0})
+    if not est:
+        raise HTTPException(status_code=404, detail="Estimate not found")
+    if est.get("order_id") and await db.orders.count_documents({"id": est["order_id"]}, limit=1):
+        raise HTTPException(status_code=409, detail=f"Estimate #{est.get('estimate_no')} is already converted to an order")
+    items = [OrderItemIn(
+        item_id=l["item_id"], item_name=l.get("item_name") or "", product_name=l.get("product_name") or "",
+        quantity=int(round(float(l.get("quantity") or 0))), rate=float(l.get("net_unit_price") or 0),
+    ) for l in est.get("lines") or [] if l.get("found") and l.get("item_id") and float(l.get("quantity") or 0) >= 1]
+    if not items:
+        raise HTTPException(status_code=400, detail="Estimate has no valid items")
+    note = f"From Estimate #{est.get('estimate_no')}" + (f" | {body.notes}" if body.notes else "")
+    order = await create_order(OrderIn(
+        customer_id=est["customer_id"], items=items, notes=note,
+        merge_with_pending=body.merge_with_pending, estimate_id=eid, estimate_no=est.get("estimate_no"),
+    ), user)
+    await db.estimates.update_one({"id": eid}, {"$set": {"order_id": order["id"], "converted_at": now_iso(), "converted_by": user["email"]}})
+    await log_order_activity(order["id"], "from_estimate", user["email"], [i.model_dump() for i in items], note=f"#{est.get('estimate_no')}")
+    return {"order": order, "estimate_no": est.get("estimate_no")}
 
 
 @api_router.get("/estimates/{eid}")
@@ -5361,6 +5638,8 @@ async def _persist_customer_transport(customer_id: Optional[str], transport_name
 async def _restore_dispatch_qty_to_orders(
     dispatch: Dict[str, Any],
     restore_items: List[Dict[str, Any]],
+    actor: Optional[str] = None,
+    reason: str = "slip_qty_restored",
 ) -> List[str]:
     """Add the given (item_id, quantity) pairs back into the dispatch's
     parent order(s). Used by DELETE /dispatches/{did} and by PATCH when the
@@ -5399,6 +5678,7 @@ async def _restore_dispatch_qty_to_orders(
 
     customer_id = dispatch.get("customer_id")
     touched: Dict[str, Dict[str, Any]] = {}  # id -> live order doc (mutated)
+    restored_log: Dict[str, List[Dict[str, Any]]] = {}
 
     for r in restore_items:
         iid = r.get("item_id")
@@ -5406,12 +5686,16 @@ async def _restore_dispatch_qty_to_orders(
         if not iid or qty <= 0:
             continue
 
-        # Pick a target order: first the dispatch's tracked candidates, then
-        # any other order of this customer that already knows this SKU.
+        # Pick a target order: first the dispatch's tracked candidates that
+        # contain this SKU, then any other order of this customer that knows it.
         target = None
         for o in candidate_orders:
-            target = touched.get(o["id"], o)
-            break
+            live = touched.get(o["id"], o)
+            if any(i.get("item_id") == iid for i in (live.get("items") or [])) or any(
+                i.get("item_id") == iid for i in (live.get("original_items") or [])
+            ):
+                target = live
+                break
         if target is None and customer_id:
             other = await db.orders.find(
                 {"customer_id": customer_id}, {"_id": 0}
@@ -5487,8 +5771,10 @@ async def _restore_dispatch_qty_to_orders(
                 }
             template["quantity"] = new_qty_to_add
             items_list.append(template)
+            qty = new_qty_to_add
 
         target["items"] = items_list
+        restored_log.setdefault(target["id"], []).append({"item_name": r.get("item_name") or r.get("product_name"), "quantity": qty})
         # If the order was Dispatched and now has items again, reopen it.
         if items_list and target.get("status") != "Pending":
             target["status"] = "Pending"
@@ -5504,6 +5790,7 @@ async def _restore_dispatch_qty_to_orders(
                 "updated_at": now_iso(),
             }},
         )
+        await log_order_activity(oid, reason, actor, restored_log.get(oid), dispatch.get("slip_no"))
     return list(touched.keys())
 
 
@@ -5542,6 +5829,7 @@ async def _revert_bom_consumption_for_dispatch(
 async def _deduct_off_order_from_pending_orders(
     customer_id: Optional[str],
     dispatched_lines: List[Dict[str, Any]],
+    alloc_out: Optional[Dict[str, Dict[str, int]]] = None,
 ) -> List[str]:
     """If the customer has pending orders that include any of the dispatched
     SKUs, deduct the dispatched quantities from those orders FIFO (oldest
@@ -5611,8 +5899,190 @@ async def _deduct_off_order_from_pending_orders(
 
         await db.orders.update_one({"id": order["id"]}, {"$set": update_doc})
         touched.append(order["id"])
+        if alloc_out is not None:
+            alloc_out[order["id"]] = dict(per_line_take)
 
     return touched
+
+
+async def _apply_order_rates(lines: List[Dict[str, Any]], alloc: Dict[str, Dict[str, int]]) -> None:
+    """Slip lines consumed from an order with an agreed rate use that rate."""
+    if not alloc:
+        return
+    rates: Dict[str, float] = {}
+    async for o in db.orders.find({"id": {"$in": list(alloc.keys())}}, {"_id": 0, "id": 1, "items": 1, "original_items": 1}):
+        for it in (o.get("original_items") or []) + (o.get("items") or []):
+            if it.get("rate") is not None and it.get("item_id") in alloc.get(o["id"], {}):
+                rates.setdefault(it["item_id"], float(it["rate"]))
+    for li in lines:
+        r = rates.get(li.get("item_id"))
+        if r is not None:
+            li["net_unit_price"] = round(r, 2)
+            li["price_override"] = True
+
+
+def _alloc_inc(alloc: Dict[str, Dict[str, int]]) -> Dict[str, int]:
+    return {f"order_alloc.{oid}.{iid}": q for oid, m in alloc.items() for iid, q in m.items()}
+
+
+def _order_sort_key(o: Dict[str, Any]):
+    return (str(o.get("order_date") or o.get("created_at") or "")[:10], str(o.get("created_at") or ""))
+
+
+async def _reconcile_customer_orders(customer_id: Optional[str], apply: bool = True,
+                                     actor: Optional[str] = None,
+                                     allow_before: Optional[Dict[str, set]] = None,
+                                     only: Optional[set] = None) -> List[Dict[str, Any]]:
+    """Apply slip quantity that is not yet attributed to any order (e.g. order
+    entered after the slip, slip reassigned to this party) to the customer's
+    Pending orders. Only slips dated on/after the order date count. Orders are
+    walked oldest-first; Dispatched/Cleared orders with no linked slip absorb
+    matching free qty first so already-fulfilled orders aren't double-counted."""
+    if not customer_id:
+        return []
+    orders = await db.orders.find({"customer_id": customer_id}, {"_id": 0}).to_list(5000)
+    if not any(o.get("status") == "Pending" for o in orders):
+        return []
+    by_id = {o["id"]: o for o in orders}
+    disps = await db.dispatches.find(
+        {"customer_id": customer_id},
+        {"_id": 0, "id": 1, "slip_no": 1, "order_id": 1, "order_ids": 1, "items": 1, "dispatched_at": 1, "order_alloc": 1},
+    ).sort("dispatched_at", 1).to_list(20000)
+
+    linked_by_order: Dict[str, set] = {}
+    free: List[Dict[str, Any]] = []
+    for d in disps:
+        linked = set(d.get("order_ids") or [])
+        if d.get("order_id"):
+            linked.add(d["order_id"])
+        lines: Dict[str, int] = {}
+        for li in d.get("items") or []:
+            iid, q = li.get("item_id"), int(li.get("quantity") or 0)
+            if iid and q > 0:
+                lines[iid] = lines.get(iid, 0) + q
+        heur: Dict[str, Dict[str, int]] = {}
+        for oid in linked:
+            linked_by_order.setdefault(oid, set()).add(d["id"])
+            o = by_id.get(oid)
+            if not o:
+                continue
+            alloc = (d.get("order_alloc") or {}).get(oid)
+            if alloc:
+                for iid, q in alloc.items():
+                    if iid in lines:
+                        lines[iid] = max(0, lines[iid] - int(q or 0))
+                continue
+            known: Dict[str, int] = {}
+            for oi in (o.get("original_items") or []) + (o.get("items") or []):
+                iid = oi.get("item_id")
+                if iid:
+                    known[iid] = max(known.get(iid, 0), int(oi.get("quantity") or 0))
+            for iid, q in known.items():
+                if lines.get(iid, 0) > 0 and q > 0:
+                    sub = min(lines[iid], q)
+                    lines[iid] -= sub
+                    heur.setdefault(oid, {})[iid] = sub
+        free.append({"d": d, "day": str(d.get("dispatched_at") or "")[:10], "lines": lines, "heur": heur})
+
+    changes: List[Dict[str, Any]] = []
+    for o in sorted(orders, key=_order_sort_key):
+        oday = str(o.get("order_date") or o.get("created_at") or "")[:10]
+        pending = o.get("status") == "Pending"
+        if not pending and linked_by_order.get(o["id"]):
+            continue
+        want: Dict[str, int] = {}
+        for it in ((o.get("items") if pending else (o.get("original_items") or o.get("items"))) or []):
+            if it.get("item_id"):
+                want[it["item_id"]] = want.get(it["item_id"], 0) + int(it.get("quantity") or 0)
+        take: Dict[str, int] = {}
+        used: List[Dict[str, Any]] = []
+        for f in free:
+            if f["day"] < oday and f["d"]["id"] not in (allow_before or {}).get(o["id"], ()):
+                continue
+            per: Dict[str, int] = {}
+            for iid, need in want.items():
+                avail = f["lines"].get(iid, 0)
+                got = take.get(iid, 0)
+                if avail > 0 and need - got > 0:
+                    t = min(avail, need - got)
+                    take[iid] = got + t
+                    f["lines"][iid] = avail - t
+                    per[iid] = t
+            if per:
+                used.append({"d": f["d"], "per": per, "heur": f["heur"]})
+        if not pending or not take:
+            continue
+        if only is not None and o["id"] not in only:
+            continue  # unselected: qty stays reserved (same as preview) but nothing changes
+        items: List[Dict[str, Any]] = []
+        for it in o.get("items") or []:
+            same = next((x for x in items if it.get("item_id") and x.get("item_id") == it.get("item_id")), None)
+            if same:
+                same["quantity"] = int(same.get("quantity") or 0) + int(it.get("quantity") or 0)
+            else:
+                items.append(dict(it))
+        new_items = _apply_line_clear_threshold(items, take, o.get("original_items") or items)
+        names = {it.get("item_id"): it.get("item_name") or it.get("product_name") for it in items}
+        changes.append({
+            "order_id": o["id"], "customer_name": o.get("customer_name"), "order_date": oday,
+            "slips": [u["d"].get("slip_no") for u in used], "applied": take,
+            "slip_lines": [{
+                "slip_no": u["d"].get("slip_no"), "date": str(u["d"].get("dispatched_at") or "")[:10],
+                "items": [{"item_name": names.get(iid) or iid, "quantity": q} for iid, q in u["per"].items()],
+            } for u in used],
+            "applied_pcs": sum(take.values()),
+            "pending_before": sum(int(it.get("quantity") or 0) for it in items),
+            "pending_after": sum(int(it.get("quantity") or 0) for it in new_items),
+            "new_status": "Dispatched" if not new_items else "Pending",
+        })
+        if not apply:
+            continue
+        upd: Dict[str, Any] = {"items": new_items, "updated_at": now_iso()}
+        if not new_items:
+            upd["status"] = "Dispatched"
+        if "original_items" not in o:
+            upd["original_items"] = items
+        await db.orders.update_one({"id": o["id"]}, {"$set": upd})
+        for u in used:
+            # Freeze earlier (inferred) links too, so later runs only use explicit allocations.
+            inc: Dict[str, int] = {}
+            for hoid, hm in u["heur"].items():
+                for iid, q in hm.items():
+                    inc[f"order_alloc.{hoid}.{iid}"] = inc.get(f"order_alloc.{hoid}.{iid}", 0) + q
+            for iid, q in u["per"].items():
+                inc[f"order_alloc.{o['id']}.{iid}"] = inc.get(f"order_alloc.{o['id']}.{iid}", 0) + q
+            await db.dispatches.update_one(
+                {"id": u["d"]["id"]},
+                {"$addToSet": {"order_ids": o["id"]}, "$inc": inc},
+            )
+            u["heur"].clear()
+            await log_order_activity(o["id"], "slip_auto_linked", actor,
+                                     [{"item_name": names.get(i) or i, "quantity": q} for i, q in u["per"].items()],
+                                     u["d"].get("slip_no"))
+    return changes
+
+
+class ReconcileIn(BaseModel):
+    order_ids: Optional[List[str]] = None
+
+
+@api_router.post("/orders/reconcile")
+async def reconcile_orders(dry_run: bool = True, body: Optional[ReconcileIn] = None, admin=Depends(require_admin)):
+    """Re-sync Pending orders with dispatch slips that were never applied to them."""
+    cids = await db.orders.distinct("customer_id", {"status": "Pending"})
+    out: List[Dict[str, Any]] = []
+    for cid in cids:
+        out.extend(await _reconcile_customer_orders(
+            cid, apply=not dry_run, actor=admin.get("email"),
+            only=set(body.order_ids) if body and body.order_ids is not None else None))
+    pending_after = await db.orders.count_documents({"status": "Pending"})
+    return {
+        "dry_run": dry_run, "count": len(out), "changes": out,
+        "total_pcs": sum(c["applied_pcs"] for c in out),
+        "fully_cleared": sum(1 for c in out if c["new_status"] == "Dispatched"),
+        "pending_orders": pending_after,
+        "checked_at": now_iso(),
+    }
 
 
 @api_router.post("/dispatch/off-order")
@@ -5717,7 +6187,9 @@ async def dispatch_off_order(body: OffOrderDispatchIn, user=Depends(require_acti
 
     # Deduct dispatched quantities from the customer's matching Pending
     # orders FIFO (Jan 2026). Walk-ins and excess qty are unaffected.
-    touched_order_ids = await _deduct_off_order_from_pending_orders(customer_id, dispatched_lines)
+    fifo_alloc: Dict[str, Dict[str, int]] = {}
+    touched_order_ids = await _deduct_off_order_from_pending_orders(customer_id, dispatched_lines, fifo_alloc)
+    await _apply_order_rates(dispatched_lines, fifo_alloc)
     any_order_fully_dispatched = False
     if touched_order_ids:
         cleared = await db.orders.count_documents(
@@ -5769,11 +6241,15 @@ async def dispatch_off_order(body: OffOrderDispatchIn, user=Depends(require_acti
                 update_set["bag_count"] = bc
             except Exception:
                 pass
-        await db.dispatches.update_one({"id": existing["id"]}, {"$set": update_set})
+        upd_ops: Dict[str, Any] = {"$set": update_set}
+        if fifo_alloc:
+            upd_ops["$inc"] = _alloc_inc(fifo_alloc)
+        await db.dispatches.update_one({"id": existing["id"]}, upd_ops)
         dispatch_doc = await db.dispatches.find_one({"id": existing["id"]}, {"_id": 0})
         # Auto-consume raw materials only for the NEW lines (merging into
         # an existing slip must not double-deduct previously dispatched items).
         await _consume_bom_for_lines(dispatched_lines, dispatch_doc["id"], user.get("email") or "")
+        await _log_alloc(fifo_alloc, dispatched_lines, user["email"], dispatch_doc.get("slip_no"))
         return {
             "dispatch": dispatch_doc,
             "merged": True,
@@ -5804,11 +6280,15 @@ async def dispatch_off_order(body: OffOrderDispatchIn, user=Depends(require_acti
         "dispatched_by": user["email"],
         "dispatched_at": dispatch_ts,
         "order_fully_dispatched": any_order_fully_dispatched,
+        "order_alloc": fifo_alloc,
     }
     await db.dispatches.insert_one(dispatch_doc)
     dispatch_doc.pop("_id", None)
     # Auto-consume raw materials for this off-order dispatch
     await _consume_bom_for_lines(dispatched_lines, dispatch_doc["id"], user.get("email") or "")
+    await _log_alloc(fifo_alloc, dispatched_lines, user["email"], dispatch_doc.get("slip_no"))
+    await _reconcile_customer_orders(customer_id, actor=user["email"])
+    dispatch_doc = await db.dispatches.find_one({"id": dispatch_doc["id"]}, {"_id": 0})
     return {"dispatch": dispatch_doc, "order_ids_touched": touched_order_ids}
 
 

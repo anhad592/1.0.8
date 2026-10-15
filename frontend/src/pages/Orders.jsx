@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from "react";
-import { useSearchParams } from "react-router-dom";
+import { useSearchParams, useLocation } from "react-router-dom";
 import { api } from "@/lib/api";
 import { Link } from "react-router-dom";
 import { useTranslation } from "react-i18next";
@@ -7,10 +7,15 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { toast } from "sonner";
-import { Plus, Search, Trash2, Edit3, AlertTriangle, Truck, Clock, CheckCircle2, MapPin } from "lucide-react";
+import { Plus, Search, Trash2, Edit3, AlertTriangle, Truck, Clock, CheckCircle2, MapPin, Undo2, History } from "lucide-react";
 import { useAuth } from "@/lib/auth";
 import OrderEditDialog from "@/components/OrderEditDialog";
 import ConfirmDialog from "@/components/ConfirmDialog";
+import SlipHistory from "@/components/SlipHistory";
+import ResyncOrders from "@/components/ResyncOrders";
+import DiscrepancyResync from "@/components/DiscrepancyResync";
+import SlipPreviewDialog from "@/components/SlipPreviewDialog";
+import OrderActivityDialog from "@/components/OrderActivityDialog";
 import { useConfirm } from "@/lib/useConfirm";
 
 const STATUSES = ["Pending", "Dispatched", "Cleared"];
@@ -37,6 +42,7 @@ function ItemChip({ it, tone = "pending", testid }) {
           className={`text-xs px-2 py-1 rounded-sm border ${cls}`}>
       <span className="font-semibold">{it.item_name || it.product_name}</span>
       {it.variant ? ` (${it.variant})` : ""}: <span className="font-mono-num font-bold">{it.quantity}</span>
+      {it.rate != null && <span className="ml-1 font-mono-num text-[10px] font-bold text-emerald-700">@₹{it.rate}</span>}
       {it.product_name && it.item_name && it.product_name !== it.item_name && (
         <span className={`text-[10px] ml-1 ${subCls}`}>· {it.product_name}</span>
       )}
@@ -61,9 +67,24 @@ export default function Orders() {
   const [q, setQ] = useState(searchParams.get("q") || "");
   const [filter, setFilter] = useState(searchParams.get("status") || "all");
   const [editTarget, setEditTarget] = useState(null);
-  const [highlightId, setHighlightId] = useState(null);
+  const location = useLocation();
+  const [highlightId, setHighlightId] = useState(location.state?.highlightId || null);
   const [discCount, setDiscCount] = useState(0);
   const { state: confirmState, confirm, close: closeConfirm } = useConfirm();
+  const [slipView, setSlipView] = useState(null);
+  const [historyOrder, setHistoryOrder] = useState(null);
+
+  const openSlip = async (slipNo) => {
+    if (slipNo == null) return;
+    try {
+      const { data } = await api.get(`/dispatches/by-slip/${slipNo}`);
+      const d = data.dispatch || {};
+      setSlipView({ row: { kind: "dispatch", id: d.id, when: d.dispatched_at || d.created_at, raw: d }, party: data.customer || null });
+    } catch (e) {
+      const detail = e?.response?.data?.detail;
+      toast.error(e?.response?.status === 410 ? t("orders.slipDeleted", { n: slipNo }) : ((typeof detail === "string" && detail) || t("common.failed")));
+    }
+  };
 
   const load = async (opts = {}) => {
     // On a silent refresh (e.g. right after editing an order) we skip the
@@ -153,6 +174,17 @@ export default function Orders() {
     });
   };
 
+  const undoDiscrepancy = async (orderId) => {
+    try {
+      await api.post(`/orders/${orderId}/undo-discrepancy`);
+      toast.success(t("orders.discUndone"));
+      await load({ silent: true });
+      setHighlightId(orderId);
+    } catch (e) {
+      toast.error(e?.response?.data?.detail || t("common.failed"));
+    }
+  };
+
   // Resolve a dispatch-before-order discrepancy. `action` is one of
   // update_date | clear | delete | keep. Reloads the list afterwards.
   const resolveDiscrepancy = async (order, action) => {
@@ -161,7 +193,10 @@ export default function Orders() {
         action,
         dispatch_id: order.discrepancy?.dispatch_id,
       });
-      toast.success(action === "delete" ? t("orders.discDeleted") : t("orders.discResolved"));
+      toast.success(action === "delete" ? t("orders.discDeleted") : t("orders.discResolved"), {
+        duration: 8000,
+        action: { label: t("orders.discUndo"), onClick: () => undoDiscrepancy(order.id) },
+      });
       load({ silent: true });
     } catch (e) {
       toast.error(e?.response?.data?.detail || t("common.failed"));
@@ -180,6 +215,10 @@ export default function Orders() {
           <Plus className="w-4 h-4 mr-1.5" /> {t("orders.newBtn")}
         </Link>
       </div>
+
+      {isAdmin && (filter === "discrepancy"
+        ? <DiscrepancyResync onApplied={() => load({ silent: true })} />
+        : <ResyncOrders className="w-full" onApplied={() => load({ silent: true })} />)}
 
       <div className="bg-white border border-slate-200 rounded-sm">
         <div className="p-4 border-b border-slate-200 flex flex-col sm:flex-row gap-3 sm:items-center">
@@ -256,6 +295,21 @@ export default function Orders() {
                       #{o.id.slice(0, 8)} · {new Date(o.order_date || o.created_at).toLocaleDateString()}
                       {o.delivery_date && <> · {t("orders.delivery")}: {new Date(o.delivery_date).toLocaleDateString()}</>}
                     </div>
+                    {o.discrepancy_undo && canEditOrders && (
+                      <div className="mt-2 inline-flex flex-wrap items-center gap-2 rounded-sm border border-amber-200 bg-amber-50/70 px-2 py-1 text-[11px] text-amber-900"
+                           data-testid={`disc-undo-bar-${o.id}`}>
+                        <AlertTriangle className="w-3.5 h-3.5 text-amber-600" />
+                        <span>{t("orders.discResolvedAs", {
+                          action: t(`orders.discActName.${o.discrepancy_undo.action}`),
+                          date: fmtDate(o.discrepancy_undo.at),
+                        })}</span>
+                        <button type="button" onClick={() => undoDiscrepancy(o.id)}
+                                data-testid={`disc-undo-btn-${o.id}`}
+                                className="inline-flex items-center gap-1 font-bold text-[#E65100] hover:underline">
+                          <Undo2 className="w-3.5 h-3.5" /> {t("orders.discUndo")}
+                        </button>
+                      </div>
+                    )}
                     {/* PENDING tab — remaining (still-open) items only */}
                     {filter === "Pending" && (
                       <div className="mt-2 flex flex-wrap gap-1.5">
@@ -264,6 +318,7 @@ export default function Orders() {
                         ))}
                       </div>
                     )}
+                    {(filter === "Pending" || filter === "Dispatched") && <SlipHistory order={o} onOpenSlip={openSlip} />}
 
                     {/* DISPATCHED tab — quantities actually shipped. Includes
                         PARTIALLY dispatched orders so shipped qty is never hidden. */}
@@ -345,7 +400,14 @@ export default function Orders() {
                           <div key={`g-${gi}`} className="flex flex-wrap items-center gap-1.5">
                             <span className="inline-flex items-center gap-1 text-[10px] uppercase tracking-wider font-bold text-indigo-700 bg-indigo-50 border border-indigo-200 px-1.5 py-0.5 rounded-sm">
                               <Truck className="w-3 h-3" /> {t("orders.briefDispatchedOn", { date: fmtDate(grp.date) })}
-                              {grp.slip_no ? ` · ${t("orders.slip", "Slip")} #${grp.slip_no}` : ""}
+                              {grp.slip_no ? " · " : ""}
+                              {grp.slip_no && (
+                                <button type="button" onClick={() => openSlip(grp.slip_no)}
+                                        data-testid={`order-brief-slip-link-${o.id}-${gi}`}
+                                        className="underline underline-offset-2 decoration-dotted hover:text-[#E65100] transition-colors">
+                                  {t("orders.slip", "Slip")} #{grp.slip_no}
+                                </button>
+                              )}
                             </span>
                             {grp.items.map((it, i) => (
                               <ItemChip key={`gi-${i}`} it={it} tone="dispatched"
@@ -413,6 +475,11 @@ export default function Orders() {
                         {STATUSES.map((s) => <SelectItem key={s} value={s}>{t(`orders.status.${s}`, s)}</SelectItem>)}
                       </SelectContent>
                     </Select>
+                    <Button variant="ghost" size="sm" onClick={() => setHistoryOrder(o)}
+                            data-testid={`order-history-${o.id}`} title={t("activity.title")}
+                            className="h-10 w-10 p-0 rounded-sm text-slate-500 hover:text-[#E65100] hover:bg-orange-50 shrink-0">
+                      <History className="w-4 h-4" />
+                    </Button>
                     {canEditOrders && (
                       <Button variant="ghost" size="sm" onClick={() => setEditTarget(o)}
                               data-testid={`order-edit-${o.id}`}
@@ -441,6 +508,11 @@ export default function Orders() {
         onOpenChange={(o) => { if (!o) setEditTarget(null); }}
         onSaved={handleSaved}
       />
+
+      <OrderActivityDialog order={historyOrder} onClose={() => setHistoryOrder(null)}
+                           onOpenSlip={(n) => { setHistoryOrder(null); openSlip(n); }} />
+
+      <SlipPreviewDialog slipRow={slipView?.row} party={slipView?.party} onClose={() => setSlipView(null)} />
 
       <ConfirmDialog
         open={!!confirmState}

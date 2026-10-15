@@ -164,6 +164,18 @@
       "Pending": "लंबित",
       "Dispatched": "डिस्पैच",
       "Cleared": "समाप्त"
+    },
+    "progress": "{{total}} में से {{done}} पीस पूरे · {{pending}} बाकी",
+    "slipCompleted": "{{pcs}} पीस पूरे",
+    "slipDeleted": "स्लिप #{{n}} डिलीट हो चुकी है",
+    "discUndo": "पूर्ववत करें",
+    "discUndone": "पूर्ववत हो गया — discrepancy फिर से दिख रही है",
+    "discResolvedAs": "टाइमिंग discrepancy हल किया: {{action}} · {{date}}",
+    "discActName": {
+      "clear": "क्लियर किया",
+      "update_date": "तारीख बदली",
+      "keep": "पेंडिंग रखा",
+      "delete": "डिलीट किया"
     }
   },
   "newOrder": {
@@ -360,7 +372,7 @@
     "customMax": "कस्टम: {{max}}/बैग",
     "usesDefault": "श्रेणी डिफ़ॉल्ट उपयोग करता है ({{min}}–{{max}}/बैग)",
     "usesDefaultMax": "श्रेणी डिफ़ॉल्ट उपयोग करता है ({{max}}/बैग)",
-    "resetTitle": "श्रेणी डिफ़ॉल्ट पर रीसेट",
+    "resetTitle": "SKU बैग ओवरराइड रीसेट करें?",
     "resetConfirm": "\"{{name}}\" को श्रेणी डिफ़ॉल्ट बैग आकार पर रीसेट करें?",
     "deleteConfirm": "\"{{name}}\" हटाएँ? यदि कोई आइटम या ऑर्डर इसका संदर्भ देता है तो यह अवरुद्ध है।",
     "editSub": "प्रति बैग अधिकतम और वेरिएंट संपादित करें। तुरंत सहेजता है।",
@@ -396,7 +408,6 @@
     "deleteSku": "SKU हटाएँ",
     "renameSkuTitle": "SKU का नाम बदलें",
     "renameSkuSub": "SKU नाम संपादित करें। ऑर्डर इतिहास ID द्वारा SKU से जुड़ा रहेगा।",
-    "resetTitle": "SKU बैग ओवरराइड रीसेट करें?",
     "deleteProductTitle": "उत्पाद हटाएँ?",
     "deleteSkuTitle": "SKU हटाएँ?",
     "deleteSkuConfirm": "SKU \"{{name}}\" हटाएँ? यदि कोई ऑर्डर संदर्भित है तो ब्लॉक रहेगा।"
@@ -416,7 +427,10 @@
     "password": "प्रारंभिक पासवर्ड",
     "passwordHint": "कम से कम 6 वर्ण",
     "role": "भूमिका",
-    "roles": { "user": "उपयोगकर्ता", "admin": "एडमिन" },
+    "roles": {
+      "user": "उपयोगकर्ता",
+      "admin": "एडमिन"
+    },
     "added": "उपयोगकर्ता {{email}} बनाया गया",
     "deleted": "उपयोगकर्ता हटाया गया",
     "confirmDeleteTitle": "उपयोगकर्ता हटाएँ?",
@@ -661,5 +675,62 @@
     "slipPrintBtn": "प्रिंट",
     "slipCloseBtn": "बंद",
     "closeBtn": "बंद"
+  },
+  "resync": {
+    "title": "पेंडिंग ऑर्डर रीसिंक",
+    "desc": "हर पेंडिंग ऑर्डर को डिस्पैच स्लिप से मिलाकर दिखाता है कि कौन से ऑर्डर भेजे जा चुके हैं पर अभी भी पेंडिंग दिख रहे हैं।",
+    "checkBtn": "पेंडिंग ऑर्डर जाँचें",
+    "applyBtn": "{{n}} ऑर्डर ठीक करें",
+    "confirmApply": "{{n}} ऑर्डर उनकी डिस्पैच स्लिप से अपडेट करें?",
+    "applied": "{{n}} ऑर्डर अपडेट हुए",
+    "statPending": "पेंडिंग ऑर्डर",
+    "statToFix": "ठीक करने हैं",
+    "statFixed": "ठीक हुए",
+    "statPcs": "मिलान हुए पीस",
+    "allGood": "सभी पेंडिंग ऑर्डर स्लिप से मेल खाते हैं — कुछ ठीक करने की ज़रूरत नहीं",
+    "willClear": "डिस्पैच हो जाएगा",
+    "willReduce": "पेंडिंग {{from}} → {{to}} पीस",
+    "checkedAt": "जाँच का समय {{at}}"
+  },
+  "activity": {
+    "title": "ऑर्डर हिस्ट्री",
+    "empty": "अभी कोई गतिविधि दर्ज नहीं है। अब से होने वाले बदलाव यहाँ दिखेंगे।",
+    "created": "ऑर्डर बनाया",
+    "items_added": "आइटम जोड़े (मर्ज)",
+    "edited": "ऑर्डर एडिट किया",
+    "deleted": "ऑर्डर डिलीट किया",
+    "status_changed": "स्टेटस बदला",
+    "slip_linked": "स्लिप से डिस्पैच",
+    "slip_auto_linked": "स्लिप से जोड़ा (ऑटो रीसिंक)",
+    "slip_edited": "स्लिप एडिट — quantity ऑर्डर में वापस",
+    "slip_deleted": "स्लिप डिलीट — quantity ऑर्डर में वापस",
+    "slip_reassigned": "स्लिप दूसरी पार्टी को — quantity वापस",
+    "slip_qty_restored": "quantity ऑर्डर में वापस",
+    "discrepancy_clear": "Discrepancy: डिस्पैच मानकर क्लियर",
+    "discrepancy_update_date": "Discrepancy: ऑर्डर तारीख बदली",
+    "discrepancy_keep": "Discrepancy: पेंडिंग रखा",
+    "discrepancy_delete": "Discrepancy: एंट्री डिलीट",
+    "discrepancy_undo": "Discrepancy action पूर्ववत",
+    "from_estimate": "एस्टिमेट से ऑर्डर बना"
+  },
+  "discResync": {
+    "title": "टाइमिंग discrepancy रीसिंक",
+    "desc": "हर 'Possible timing discrepancy' को Settings की detection window के हिसाब से फिर से जाँचता है और उसी window में छूटी हुई भी ढूँढता है। बची हुई quantity ऑर्डर में लग जाती है; अगर स्लिप किसी और ऑर्डर में लग चुकी है तो warning हटा दी जाती है (गलत अलार्म)।",
+    "checkBtn": "Discrepancy जाँचें",
+    "applyBtn": "{{n}} ऑर्डर पर लागू करें",
+    "confirm": "{{n}} discrepancy अपने-आप हल करें? हर एक को ऑर्डर से पूर्ववत किया जा सकता है।",
+    "applied": "{{n}} discrepancy हल हुईं",
+    "statTotal": "कुल discrepancy",
+    "statClear": "क्लियर होंगी",
+    "statKeep": "गलत अलार्म",
+    "clearFull": "स्लिप लगी → डिस्पैच",
+    "clearPart": "स्लिप लगी · पेंडिंग {{from}} → {{to}}",
+    "keep": "स्लिप दूसरे ऑर्डर में लगी → warning हटेगी",
+    "allGood": "कोई टाइमिंग discrepancy नहीं — कुछ ठीक करने की ज़रूरत नहीं",
+    "undoHint": "हर बदलाव ऑर्डर पर 'पूर्ववत करें' से वापस हो सकता है।",
+    "statMissed": "Warning में छूटीं",
+    "missedBadge": "छूटी हुई",
+    "missedWhy": "इसकी warning नहीं दिखी थी — आपकी detection window के अंदर (ऑर्डर {{entered}} को डाला) की एक स्लिप में इस ऑर्डर के आइटम की quantity अभी किसी ऑर्डर में नहीं लगी है।",
+    "selectAll": "सभी चुनें ({{n}}/{{total}})"
   }
 }

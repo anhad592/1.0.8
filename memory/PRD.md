@@ -19,7 +19,8 @@ Full-stack Factory Order Management ERP (React + FastAPI + MongoDB): user roles,
 6. `sudo supervisorctl restart all`, smoke check `/health` + login page
 
 ## Implemented (history)
-- Sequential repo syncs: 6-AUG → 24aug → 25aug → 28f → 29f → 30 → 32 → 34 → 36 → 38 → 39 → 41 → **44 (current, 2026-10-02)**
+- Sequential repo syncs: 6-AUG → 24aug → 25aug → 28f → 29f → 30 → 32 → 34 → 36 → 38 → 39 → 41 → 44 → **45 (current, 2026-10-15)**
+- Repo 45 bumped many backend pins (aiohttp, emergentintegrations 0.2.2, litellm 1.80.0 wheel, pandas 3.0.6, PyJWT 2.15.1, +xlrd). Gotcha: the litellm `#sha256=` hash fragment in requirements.txt breaks pip resolution ("ResolutionImpossible") — had to strip the fragment; install needs `--extra-index-url https://d33sy5i8bnduwe.cloudfront.net/simple/`.
 - Repo 44 added frontend deps `@dnd-kit/core`, `@dnd-kit/sortable`, `@dnd-kit/utilities` (drag-and-drop). `.env` has no repo copy, preserved as-is.
 - Repo 39 highlights: Facebook-style login page (by design), Estimates, PurchaseCenter, Suppliers/Vendor ledgers, TransportRoutes, AI chatbot, price lists, login attestation flow
 - Past custom work (may or may not survive repo replacements): OTP toggle, JK1 blank-view user, order/dispatch edit fixes, pvt-marka/bill-number exclusivity, leaflet maps (repo 38)

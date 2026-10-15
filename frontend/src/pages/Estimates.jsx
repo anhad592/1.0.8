@@ -13,8 +13,11 @@ import ItemSearchInput from "@/components/ItemSearchInput";
 import ConfirmDialog from "@/components/ConfirmDialog";
 import { useConfirm } from "@/lib/useConfirm";
 import { useAuth } from "@/lib/auth";
+import { useNavigate } from "react-router-dom";
+import { ClipboardCheck } from "lucide-react";
 
-const EMPTY_ROW = { item_id: "", item_name: "", product_name: "", quantity: "" };
+const EMPTY_ROW = { item_id: "", item_name: "", product_name: "", quantity: "", price: "" };
+const toItem = (r) => ({ item_id: r.item_id, quantity: Number(r.quantity), ...(r.price !== "" && r.price != null && !isNaN(Number(r.price)) ? { price_override: Number(r.price) } : {}) });
 
 /**
  * Estimates — quotation flow that mirrors the New-Order screen layout so
@@ -101,6 +104,31 @@ export default function Estimates() {
     }
   };
 
+  const navigate = useNavigate();
+  const convertToOrder = (rec) => {
+    confirm({
+      title: `Estimate #${rec.estimate_no} → Order?`,
+      description: `A new Pending order will be created for ${rec.customer_name} using the estimate rates. Dispatch slips for this order will use the same rates.`,
+      confirmLabel: "Create order",
+      cancelLabel: "Cancel",
+      onConfirm: async () => {
+        closeConfirm();
+        try {
+          const { data } = await api.post(`/estimates/${rec.id}/convert-to-order`, {});
+          const oid = data.order.id;
+          setRecords((prev) => prev.map((r) => (r.id === rec.id ? { ...r, order_id: oid } : r)));
+          setEstimate((prev) => (prev && prev.id === rec.id ? { ...prev, order_id: oid } : prev));
+          toast.success(`Order created from Estimate #${rec.estimate_no}`, {
+            duration: 8000,
+            action: { label: "Open order", onClick: () => navigate("/orders", { state: { highlightId: oid } }) },
+          });
+        } catch (e) {
+          toast.error(e?.response?.data?.detail || "Could not create order");
+        }
+      },
+    });
+  };
+
   const deleteRecord = (rec) => {
     confirm({
       title: `Delete estimate #${rec.estimate_no}?`,
@@ -179,7 +207,7 @@ export default function Estimates() {
     if (!selectedCustomer) { toast.error("Please select a customer first"); return; }
     const items = rows
       .filter((r) => r.item_id && Number(r.quantity) > 0)
-      .map((r) => ({ item_id: r.item_id, quantity: Number(r.quantity) }));
+      .map(toItem);
     if (items.length === 0) { toast.error("Add at least one SKU with a quantity"); return; }
     setBusy(true);
     try {
@@ -235,10 +263,7 @@ export default function Estimates() {
       try {
         const { data } = await api.post("/estimates/compute", {
           customer_id: selectedCustomer.id,
-          items: validRows.map((r) => ({
-            item_id: r.item_id,
-            quantity: Number(r.quantity),
-          })),
+          items: validRows.map(toItem),
           bill_amount: 0, // preview only — bill amount only matters at "Generate"
           price_list_id_override: priceListOverride || null,
         });
@@ -269,7 +294,7 @@ export default function Estimates() {
     }, 250);
     return () => { cancelled = true; clearTimeout(timer); };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [selectedCustomer?.id, priceListOverride, JSON.stringify(rows.map((r) => ({ i: r.item_id, q: r.quantity })))]);
+  }, [selectedCustomer?.id, priceListOverride, JSON.stringify(rows.map((r) => ({ i: r.item_id, q: r.quantity, p: r.price })))]);
 
   const fmtINR = (n) =>
     new Intl.NumberFormat("en-IN", { maximumFractionDigits: 2 }).format(Number(n || 0));
@@ -301,6 +326,19 @@ export default function Estimates() {
             <Button variant="outline" onClick={resetAll} className="rounded-sm h-10">
               New estimate
             </Button>
+            {estimate.id && (estimate.order_id ? (
+              <Button variant="outline" onClick={() => navigate("/orders", { state: { highlightId: estimate.order_id } })}
+                      className="rounded-sm h-10 border-emerald-300 text-emerald-700 hover:bg-emerald-50"
+                      data-testid="estimate-open-order-btn">
+                <ClipboardCheck className="w-4 h-4 mr-1.5" /> Order created · View
+              </Button>
+            ) : (
+              <Button onClick={() => convertToOrder({ id: estimate.id, estimate_no: estimate.estimate_no, customer_name: estimate.customer?.name || estimate.customer_name })}
+                      className="bg-emerald-600 hover:bg-emerald-700 text-white rounded-sm h-10"
+                      data-testid="estimate-convert-order-btn">
+                <ClipboardCheck className="w-4 h-4 mr-1.5" /> Convert to Order
+              </Button>
+            ))}
             <Button
               onClick={() => window.print()}
               className="bg-[#E65100] hover:bg-[#CC4800] text-white rounded-sm h-10"
@@ -414,6 +452,20 @@ export default function Estimates() {
                       </td>
                       <td className="py-2.5 px-4">
                         <div className="flex items-center justify-end gap-1.5">
+                          {r.order_id ? (
+                            <Button size="sm" variant="ghost"
+                                    onClick={() => navigate("/orders", { state: { highlightId: r.order_id } })}
+                                    data-testid={`estimate-record-order-${r.estimate_no}`}
+                                    className="h-8 rounded-sm text-emerald-700 hover:bg-emerald-50 font-bold">
+                              <ClipboardCheck className="w-3.5 h-3.5 mr-1" /> Order ✓
+                            </Button>
+                          ) : (
+                            <Button size="sm" onClick={() => convertToOrder(r)}
+                                    data-testid={`estimate-record-convert-${r.estimate_no}`}
+                                    className="h-8 rounded-sm bg-emerald-600 hover:bg-emerald-700 text-white">
+                              <ClipboardCheck className="w-3.5 h-3.5 mr-1" /> To Order
+                            </Button>
+                          )}
                           <Button
                             size="sm"
                             variant="outline"
@@ -641,10 +693,11 @@ export default function Estimates() {
             <div className="space-y-2">
               {rows.map((r, idx) => {
                 const priced = r.item_id ? linePricing[r.item_id] : null;
-                const net = Number(priced?.net_unit_price || 0);
+                const listNet = Number(priced?.list_net_unit_price ?? priced?.net_unit_price ?? 0);
+                const typed = r.price !== "" && r.price != null;
+                const net = typed ? Number(r.price) || 0 : listNet;
                 const qty = Number(r.quantity || 0);
                 const lineTotal = qty > 0 ? qty * net : 0;
-                const hasPrice = !!(r.item_id && priced && net > 0);
                 return (
                   <div
                     key={idx}
@@ -666,6 +719,7 @@ export default function Estimates() {
                             product_name: r.product_name,
                           } : null}
                           onChange={(picked) => updateRow(idx, {
+                            price: "",
                             item_id: picked?.item_id || "",
                             item_name: picked?.item_name || "",
                             product_name: picked?.product_name || "",
@@ -674,30 +728,34 @@ export default function Estimates() {
                           customerId={selectedCustomer?.id || null}
                         />
                       </div>
-                      {/* NET price cell — sits between item and qty */}
+                      {/* NET price cell — editable; empty = price-list rate */}
                       <div
-                        className="col-span-6 sm:col-span-2 h-11 rounded-sm border border-slate-200 bg-white flex flex-col items-end justify-center px-3"
+                        className={`col-span-6 sm:col-span-2 h-11 rounded-sm border bg-white flex flex-col items-end justify-center px-3 focus-within:ring-2 focus-within:ring-[#E65100]/40 ${typed ? "border-[#E65100]" : "border-slate-200"}`}
                         data-testid={`estimate-row-inline-net-${idx}`}
                       >
-                        <span className="uppercase font-bold text-[9px] tracking-wider text-slate-500 leading-none">
+                        <span className="uppercase font-bold text-[9px] tracking-wider text-slate-500 leading-none flex items-center gap-1">
                           Price
+                          {typed && listNet > 0 && Number(r.price) !== listNet && (
+                            <button type="button" onClick={() => updateRow(idx, { price: "" })}
+                                    data-testid={`estimate-price-reset-${idx}`}
+                                    className="normal-case tracking-normal font-semibold text-[#E65100] hover:underline">
+                              list ₹{fmtINR(listNet)}
+                            </button>
+                          )}
                         </span>
-                        {r.item_id && hasPrice ? (
-                          <span
-                            className="font-mono-num font-extrabold text-slate-900 text-base leading-tight"
+                        <div className="flex items-center w-full justify-end">
+                          <span className="font-mono-num font-extrabold text-slate-900 text-base">₹</span>
+                          <input
+                            type="number" min="0" step="0.01" inputMode="decimal"
+                            disabled={!r.item_id}
+                            value={r.price}
+                            placeholder={r.item_id ? (previewBusy && !priced ? "…" : (listNet > 0 ? String(listNet) : "no price")) : "—"}
+                            onChange={(e) => updateRow(idx, { price: e.target.value })}
+                            onFocus={(e) => e.target.select()}
                             data-testid={`estimate-row-net-${idx}`}
-                          >
-                            ₹{fmtINR(net)}
-                          </span>
-                        ) : r.item_id && previewBusy ? (
-                          <span className="italic text-slate-400 text-[11px] leading-tight">…</span>
-                        ) : r.item_id ? (
-                          <span className="italic text-rose-600 font-semibold text-[10px] leading-tight">
-                            no price
-                          </span>
-                        ) : (
-                          <span className="text-slate-300 text-base leading-tight">—</span>
-                        )}
+                            className="w-full bg-transparent text-right font-mono-num font-extrabold text-slate-900 text-base leading-tight outline-none no-spinner placeholder:text-slate-900 placeholder:font-extrabold disabled:placeholder:text-slate-300"
+                          />
+                        </div>
                       </div>
                       <div className="col-span-3 sm:col-span-2">
                         <Input
@@ -886,8 +944,6 @@ export default function Estimates() {
               <tr className="border-b-2 border-slate-800 text-[11px] uppercase tracking-wider text-slate-700">
                 <th className="text-left py-2 px-2 w-full">Item</th>
                 <th className="text-right py-2 px-2 w-16">Qty</th>
-                <th className="text-right py-2 px-2 w-24 print:hidden">Rate ₹</th>
-                <th className="text-right py-2 px-2 w-24 print:hidden">Disc.</th>
                 <th className="text-right py-2 px-2 w-24">Net ₹</th>
                 <th className="text-right py-2 px-2 w-28 print:pr-8">Line ₹</th>
               </tr>
@@ -911,12 +967,6 @@ export default function Estimates() {
                     )}
                   </td>
                   <td className="py-2 px-2 text-right tabular-nums font-mono">{l.quantity}</td>
-                  <td className="py-2 px-2 text-right tabular-nums font-mono print:hidden">
-                    {l.unit_price.toFixed(2)}
-                  </td>
-                  <td className="py-2 px-2 text-right tabular-nums font-mono print:hidden">
-                    {l.discount_value > 0 ? `${l.discount_value}${l.discount_type}` : "—"}
-                  </td>
                   <td className="py-2 px-2 text-right tabular-nums font-mono">
                     {l.net_unit_price.toFixed(2)}
                   </td>
@@ -929,8 +979,6 @@ export default function Estimates() {
             <tfoot>
               <tr className="border-t-2 border-slate-800">
                 <td colSpan={2} className="py-2 px-2"></td>
-                <td className="py-2 px-2 print:hidden"></td>
-                <td className="py-2 px-2 print:hidden"></td>
                 <td className="py-2 px-2 text-right font-bold uppercase tracking-wider text-slate-800 whitespace-nowrap">
                   Line total
                 </td>
