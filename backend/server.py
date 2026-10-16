@@ -5,6 +5,7 @@ from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
 import os
 import io
+import contextvars
 import re
 import json
 import base64
@@ -24,7 +25,27 @@ load_dotenv(ROOT_DIR / '.env')
 
 mongo_url = os.environ['MONGO_URL']
 client = AsyncIOMotorClient(mongo_url)
-db = client[os.environ['DB_NAME']]
+_main_db = client[os.environ['DB_NAME']]
+# Blank-view (demo) accounts like JK1 read/write an isolated, empty database.
+_blank_db = client[os.environ['DB_NAME'] + "_blank"]
+_use_blank_db = contextvars.ContextVar("use_blank_db", default=False)
+_SHARED_COLLECTIONS = {"users", "admin_otp_challenges", "login_attestations"}
+
+
+class _DBRouter:
+    def _pick(self, name):
+        return _blank_db if (_use_blank_db.get() and name not in _SHARED_COLLECTIONS) else _main_db
+
+    def __getattr__(self, name):
+        if name.startswith("_"):
+            raise AttributeError(name)
+        return getattr(self._pick(name), name)
+
+    def __getitem__(self, name):
+        return self._pick(name)[name]
+
+
+db = _DBRouter()
 
 JWT_SECRET = os.environ['JWT_SECRET']
 JWT_ALG = os.environ.get('JWT_ALG', 'HS256')
@@ -579,6 +600,7 @@ async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(s
         user = await db.users.find_one({"id": payload["sub"]}, {"_id": 0, "password": 0})
         if not user:
             raise HTTPException(status_code=401, detail="User not found")
+        _use_blank_db.set(bool(user.get("blank_view")))
         return user
     except jwt.PyJWTError:
         raise HTTPException(status_code=401, detail="Invalid token")
@@ -628,7 +650,7 @@ DEMO_USERNAMES = {"JK1"}
 
 def require_users_admin(user: Dict[str, Any] = Depends(require_admin)) -> Dict[str, Any]:
     uname = str(user.get("username") or "").strip().upper()
-    if uname in {u.upper() for u in DEMO_USERNAMES}:
+    if uname in {u.upper() for u in DEMO_USERNAMES} or user.get("blank_view"):
         raise HTTPException(status_code=403, detail="Not permitted for this account")
     return user
 
@@ -884,7 +906,9 @@ async def me(user=Depends(get_current_user)):
 
 # ======================== Admin: User Management ========================
 @api_router.get("/users")
-async def list_users(admin=Depends(require_users_admin)):
+async def list_users(admin=Depends(require_admin)):
+    if admin.get("blank_view"):
+        return [admin]
     users = await db.users.find({}, {"_id": 0, "password": 0}).sort("created_at", 1).to_list(500)
     return users
 
@@ -1331,13 +1355,13 @@ async def patch_backup_settings(body: BackupSettingsUpdate, admin=Depends(requir
 
 
 @api_router.post("/admin/backup/run")
-async def run_backup_now(admin=Depends(require_admin)):
+async def run_backup_now(admin=Depends(require_users_admin)):
     """Trigger an immediate backup-and-email run."""
     return await backup_mod.run_backup_now(db)
 
 
 @api_router.post("/admin/backup/restore")
-async def restore_backup(file: UploadFile = File(...), admin=Depends(require_admin)):
+async def restore_backup(file: UploadFile = File(...), admin=Depends(require_users_admin)):
     """Replace the entire database with the contents of the uploaded ZIP.
     Protected collections (e.g. backup settings themselves) are kept intact.
     """
@@ -1744,7 +1768,7 @@ async def bulk_delete_customers(body: CustomerBulkDeleteIn, admin=Depends(requir
 
 
 @api_router.get("/customers/import/template")
-async def customer_import_template(admin=Depends(require_admin)):
+async def customer_import_template(admin=Depends(require_action("add:customers"))):
     """Download a blank Excel template for bulk customer import."""
     from openpyxl import Workbook
     from fastapi.responses import StreamingResponse
@@ -2248,6 +2272,7 @@ async def list_orders(status_filter: Optional[str] = None, user=Depends(get_curr
                          for it in (o.get("items") or []) if it.get("item_name")}
             best = None
             best_dt = None
+            all_slips: List[Dict[str, Any]] = []
             for d in cust_disp.get(o.get("customer_id") or "", []):
                 # Skip dispatches already linked to THIS order.
                 if d.get("order_id") == o["id"] or o["id"] in (d.get("order_ids") or []):
@@ -2277,6 +2302,8 @@ async def list_orders(status_filter: Optional[str] = None, user=Depends(get_curr
                         })
                 if not matched:
                     continue
+                all_slips.append({"dispatch_id": d.get("id"), "slip_no": d.get("slip_no"),
+                                  "dispatched_at": d.get("dispatched_at"), "items": matched})
                 # Prefer the most recent qualifying dispatch.
                 if best_dt is None or disp_dt > best_dt:
                     best_dt = disp_dt
@@ -2288,7 +2315,32 @@ async def list_orders(status_filter: Optional[str] = None, user=Depends(get_curr
                         "entered_at": o.get("created_at"),
                         "items": matched,
                     }
+            if best:
+                all_slips.sort(key=lambda x: str(x.get("dispatched_at") or ""))
+                best["slips"] = all_slips
             o["discrepancy"] = best
+
+    # How much of each flagged slip is still unused (not taken by any other
+    # order) and would actually apply to this order on "clear".
+    disc_by_cust: Dict[str, Dict[str, set]] = {}
+    for o in items:
+        if o.get("discrepancy"):
+            disc_by_cust.setdefault(o.get("customer_id") or "", {})[o["id"]] = {
+                s_["dispatch_id"] for s_ in o["discrepancy"]["slips"]}
+    usable: Dict[str, Dict[str, Any]] = {}
+    for cid, allow in disc_by_cust.items():
+        for ch in await _reconcile_customer_orders(cid, apply=False, allow_before=allow):
+            usable[ch["order_id"]] = ch
+    for o in items:
+        dsc = o.get("discrepancy")
+        if not dsc:
+            continue
+        ch = usable.get(o["id"])
+        per_slip = {sl["slip_no"]: sl["items"] for sl in (ch or {}).get("slip_lines") or []}
+        for sl in dsc["slips"]:
+            sl["usable"] = per_slip.get(sl["slip_no"], [])
+        dsc["usable_pcs"] = sum(it["quantity"] for v in per_slip.values() for it in v)
+        dsc["pending_after"] = (ch or {}).get("pending_after")
     return items
 
 
@@ -2360,6 +2412,7 @@ class DiscrepancyResolveIn(BaseModel):
     # One of: "update_date" | "clear" | "delete" | "keep"
     action: str
     dispatch_id: Optional[str] = None
+    dispatch_ids: Optional[List[str]] = None  # clear: every flagged slip
 
 
 @api_router.post("/orders/{oid}/resolve-discrepancy")
@@ -2387,15 +2440,17 @@ async def resolve_discrepancy(oid: str, body: DiscrepancyResolveIn,
     if not has_action_permission(user, need):
         raise HTTPException(status_code=403, detail="You don't have permission for this action.")
 
-    disp_before = None
-    if body.dispatch_id and action == "clear":
-        disp_before = await db.dispatches.find_one(
-            {"id": body.dispatch_id}, {"_id": 0, "order_ids": 1, "order_fully_dispatched": 1, "updated_at": 1})
+    clear_ids = list(dict.fromkeys((body.dispatch_ids or []) + ([body.dispatch_id] if body.dispatch_id else [])))
+    disps_before = []
+    if action == "clear" and clear_ids:
+        disps_before = await db.dispatches.find(
+            {"id": {"$in": clear_ids}}, {"_id": 0, "id": 1, "order_ids": 1, "order_fully_dispatched": 1}).to_list(100)
     await db.discrepancy_undo.delete_many({"order_id": oid})
     await db.discrepancy_undo.insert_one({
         "order_id": oid, "action": action, "at": now_iso(),
         "by": user.get("email") or user.get("username") or "",
-        "order_before": order, "dispatch_id": body.dispatch_id, "dispatch_before": disp_before,
+        "order_before": order, "dispatch_id": None, "dispatch_before": None,
+        "dispatches_before": disps_before,
     })
     _slip = (await db.dispatches.find_one({"id": body.dispatch_id}, {"_id": 0, "slip_no": 1}) or {}).get("slip_no") if body.dispatch_id else None
     await log_order_activity(oid, f"discrepancy_{action}", user.get("email"), slip_no=_slip)
@@ -2410,6 +2465,17 @@ async def resolve_discrepancy(oid: str, body: DiscrepancyResolveIn,
             {"$set": {"discrepancy_dismissed": True, "updated_at": now_iso()}},
         )
         return {"ok": True, "action": action, "order": await db.orders.find_one({"id": oid}, {"_id": 0})}
+
+    if action == "clear":
+        # Quantity-aware: apply only the unused qty of each flagged slip (a slip
+        # already used by another order is not counted twice).
+        ch = await _reconcile_customer_orders(
+            order.get("customer_id"), apply=True, actor=user.get("email"),
+            allow_before={oid: set(clear_ids)}, only={oid})
+        await db.orders.update_one({"id": oid}, {"$set": {"discrepancy_dismissed": True, "updated_at": now_iso()}})
+        mine = next((c for c in ch if c["order_id"] == oid), None)
+        return {"ok": True, "action": action, "applied_pcs": (mine or {}).get("applied_pcs", 0),
+                "order": await db.orders.find_one({"id": oid}, {"_id": 0})}
 
     # The remaining actions reference the matched dispatch.
     disp = None
@@ -2427,52 +2493,6 @@ async def resolve_discrepancy(oid: str, body: DiscrepancyResolveIn,
         )
         return {"ok": True, "action": action, "order": await db.orders.find_one({"id": oid}, {"_id": 0})}
 
-    # action == "clear" → reconcile the order against the existing dispatch.
-    # IMPORTANT: only the items ACTUALLY on the dispatch slip are treated as
-    # shipped. A discrepancy dispatch frequently covers just SOME of the
-    # order's SKUs, so clearing the WHOLE order (as this used to do) wrongly
-    # showed every line as dispatched. Items that are NOT on the slip stay
-    # Pending so a later slip can ship them. The order becomes fully
-    # Dispatched only when the slip covers every remaining line.
-    slip_ids = {it.get("item_id") for it in (disp.get("items") or []) if it.get("item_id")}
-    slip_names = {(it.get("item_name") or "").strip().lower()
-                  for it in (disp.get("items") or []) if it.get("item_name")}
-
-    def _on_slip(it: Dict[str, Any]) -> bool:
-        iid = it.get("item_id")
-        inm = (it.get("item_name") or "").strip().lower()
-        return bool((iid and iid in slip_ids) or (inm and inm in slip_names))
-
-    order_items = order.get("items") or []
-    remaining_items = [it for it in order_items if not _on_slip(it)]
-    fully_dispatched = len(remaining_items) == 0
-
-    # Link this order onto the dispatch for traceability …
-    order_ids = list(disp.get("order_ids") or [])
-    if oid not in order_ids:
-        order_ids.append(oid)
-    await db.dispatches.update_one(
-        {"id": disp["id"]},
-        {"$set": {"order_ids": order_ids,
-                  "order_fully_dispatched": fully_dispatched,
-                  "updated_at": now_iso()}},
-    )
-    # Snapshot the pre-clear item list once so restores/reports keep a stable
-    # baseline of what the order originally contained.
-    if "original_items" not in order:
-        await db.orders.update_one(
-            {"id": oid}, {"$set": {"original_items": order_items}}
-        )
-    # Remove ONLY the shipped (on-slip) lines. Keep the rest Pending.
-    await db.orders.update_one(
-        {"id": oid},
-        {"$set": {"items": remaining_items,
-                  "status": "Dispatched" if fully_dispatched else "Pending",
-                  "discrepancy_dismissed": True, "updated_at": now_iso()}},
-    )
-    return {"ok": True, "action": action,
-            "fully_dispatched": fully_dispatched,
-            "order": await db.orders.find_one({"id": oid}, {"_id": 0})}
 
 
 def _parse_iso(s):
@@ -2502,7 +2522,7 @@ async def discrepancy_resync(dry_run: bool = True,
     for o in pend:
         if o.get("discrepancy"):
             d = o["discrepancy"]
-            cands[o["id"]] = {"o": o, "slips": {d["dispatch_id"]: d}, "missed": False}
+            cands[o["id"]] = {"o": o, "slips": {x["dispatch_id"]: x for x in (d.get("slips") or [d])}, "missed": False}
     disp_cache: Dict[str, List[Dict[str, Any]]] = {}
     for o in pend:
         if o.get("discrepancy_dismissed") and o["id"] not in cands:
@@ -2944,7 +2964,7 @@ async def dispatch_match(body: DispatchStockIn, user=Depends(get_current_user)):
 
 
 @api_router.post("/dispatch/execute")
-async def dispatch_execute(body: DispatchExecuteIn, user=Depends(require_action("add:dispatch"))):
+async def dispatch_execute(body: DispatchExecuteIn, user=Depends(require_action("add:customerLedger"))):
     """Partially fulfill a pending order. Subtracts the given quantities from
     each item line. Items hitting 0 are removed. If the order has no items
     left, it is marked Dispatched; otherwise it stays Pending so the
@@ -3362,9 +3382,11 @@ async def admin_dispatch_ledger(
 
 
 @api_router.patch("/dispatches/{did}/gr")
-async def update_dispatch_gr(did: str, body: DispatchGrUpdate, user=Depends(require_action("edit:dispatch"))):
+async def update_dispatch_gr(did: str, body: DispatchGrUpdate, user=Depends(get_current_user)):
     """Set / update the GR (Goods Receipt) number for a dispatch.
     Any authenticated user can edit this field (per product spec)."""
+    if not (has_action_permission(user, "edit:dispatch") or has_action_permission(user, "edit:customerLedger")):
+        raise HTTPException(status_code=403, detail="You don't have permission to edit or delete here. Ask an admin to grant access.")
     gr = (body.gr_number or "").strip()
     res = await db.dispatches.update_one(
         {"id": did},
@@ -3417,8 +3439,11 @@ class DispatchEdit(BaseModel):
     dispatched_at: Optional[str] = None
 
 
+_LEDGER_DISPATCH_FIELDS = ("total_value", "items", "customer_id", "dispatched_at")
+
+
 @api_router.patch("/dispatches/{did}")
-async def update_dispatch(did: str, body: DispatchEdit, user=Depends(require_action("edit:dispatch"))):
+async def update_dispatch(did: str, body: DispatchEdit, user=Depends(get_current_user)):
     """Edit a dispatch's bookkeeping fields (GR, transport, notes, bill
     amount, bag count) and optionally its line items (name / qty / price).
 
@@ -3437,6 +3462,13 @@ async def update_dispatch(did: str, body: DispatchEdit, user=Depends(require_act
     (admin-configurable in /api/settings, default 3 days) of when it was
     punched. Admins can edit at any time.
     """
+    # Amount / items / party / date change the customer ledger → need "Edit customer ledger".
+    # Report-only fields (GR, transport, notes, bags, bill no.) also allow "Edit dispatch report".
+    touches_ledger = any(getattr(body, f) is not None for f in _LEDGER_DISPATCH_FIELDS)
+    allowed = has_action_permission(user, "edit:customerLedger") or (
+        not touches_ledger and has_action_permission(user, "edit:dispatch"))
+    if not allowed:
+        raise HTTPException(status_code=403, detail="You don't have permission to edit or delete here. Ask an admin to grant access.")
     existing = await db.dispatches.find_one({"id": did}, {"_id": 0})
     if not existing:
         raise HTTPException(status_code=404, detail="Dispatch not found")
@@ -3619,7 +3651,7 @@ async def update_dispatch(did: str, body: DispatchEdit, user=Depends(require_act
 
 
 @api_router.delete("/dispatches/{did}")
-async def delete_dispatch(did: str, admin=Depends(require_action("delete:dispatch"))):
+async def delete_dispatch(did: str, admin=Depends(require_action("delete:customerLedger"))):
     """Delete a dispatch record (admin only) and rebalance the customer's
     parent order(s) + raw-material stock so the system stays consistent.
 
@@ -4167,6 +4199,7 @@ async def clone_price_list(plid: str, body: PriceListCloneIn, admin=Depends(requ
         "id": new_id,
         "name": new_name,
         "description": new_desc,
+        "bill_amount_required": src.get("bill_amount_required", True),
         "created_at": now,
         "updated_at": now,
     }
@@ -4211,7 +4244,7 @@ async def clone_price_list(plid: str, body: PriceListCloneIn, admin=Depends(requ
 
 
 @api_router.post("/price-lists/{plid}/delink-customers")
-async def delink_price_list_from_customers(plid: str, admin=Depends(require_admin)):
+async def delink_price_list_from_customers(plid: str, admin=Depends(require_action("edit:priceLists"))):
     """Task 3 — Bulk-detach a price list from every customer currently
     assigned to it. The list itself remains intact (items + discounts
     preserved); only the per-customer `price_list_id` references are
@@ -4254,7 +4287,7 @@ async def get_price_list_detail(plid: str, user=Depends(get_current_user)):
 
 
 @api_router.post("/price-lists/{plid}/items")
-async def set_price_list_item(plid: str, body: PriceListItemIn, admin=Depends(require_admin)):
+async def set_price_list_item(plid: str, body: PriceListItemIn, admin=Depends(require_action("edit:priceLists"))):
     pl = await db.price_lists.find_one({"id": plid}, {"_id": 0})
     if not pl:
         raise HTTPException(status_code=404, detail="Price list not found")
@@ -4278,7 +4311,7 @@ async def set_price_list_item(plid: str, body: PriceListItemIn, admin=Depends(re
 
 
 @api_router.post("/price-lists/{plid}/discounts")
-async def set_price_list_category_discount(plid: str, body: CategoryDiscountIn, admin=Depends(require_admin)):
+async def set_price_list_category_discount(plid: str, body: CategoryDiscountIn, admin=Depends(require_action("edit:priceLists"))):
     pl = await db.price_lists.find_one({"id": plid}, {"_id": 0})
     if not pl:
         raise HTTPException(status_code=404, detail="Price list not found")
@@ -5582,6 +5615,8 @@ async def list_login_attestations(
     admin=Depends(require_admin),
 ):
     """Admin-only audit log of all login captures (most recent first)."""
+    if is_blank_view(admin):
+        return {"total": 0, "items": []}
     q: Dict[str, Any] = {}
     if user_id:
         q["user_id"] = user_id
@@ -6086,7 +6121,7 @@ async def reconcile_orders(dry_run: bool = True, body: Optional[ReconcileIn] = N
 
 
 @api_router.post("/dispatch/off-order")
-async def dispatch_off_order(body: OffOrderDispatchIn, user=Depends(require_action("add:dispatch"))):
+async def dispatch_off_order(body: OffOrderDispatchIn, user=Depends(require_action("add:customerLedger"))):
     """Dispatch SKUs to a party — used either for walk-ins (no parent
     order) OR for an existing customer where the operator wants to short-
     circuit the regular allocation flow. Now available to BOTH admins and
@@ -6761,7 +6796,7 @@ async def delete_vendor_price_list_item(vpl_id: str, vpi_id: str, admin=Depends(
 
 
 @api_router.get("/vendor-price-lists/{vpl_id}/import/template")
-async def vendor_price_list_import_template(vpl_id: str, admin=Depends(require_admin)):
+async def vendor_price_list_import_template(vpl_id: str, admin=Depends(require_action("add:vendorPriceLists"))):
     """Download a blank Excel template for bulk vendor-price-list item import."""
     from openpyxl import Workbook
     from fastapi.responses import StreamingResponse
@@ -7961,7 +7996,7 @@ async def list_rm_movements(rid: str, limit: int = 100, user=Depends(get_current
 
 
 @api_router.post("/raw-materials/{rid}/adjust")
-async def adjust_rm_stock(rid: str, body: RawMaterialAdjustIn, admin=Depends(require_admin)):
+async def adjust_rm_stock(rid: str, body: RawMaterialAdjustIn, admin=Depends(require_action("edit:rawMaterials"))):
     """Manual ± stock adjustment. Logged in `raw_material_movements`."""
     if body.delta == 0:
         raise HTTPException(status_code=400, detail="delta cannot be zero")

@@ -24,7 +24,10 @@ import { useConfirm } from "@/lib/useConfirm";
  *  - Excel template upload (Item Name | Price) and download.
  */
 export default function PriceLists() {
-  const { isAdmin } = useAuth();
+  const { isAdmin, can, canAct } = useAuth();
+  const canAdd = canAct("add:priceLists");
+  const canEdit = canAct("edit:priceLists");
+  const canDelete = canAct("delete:priceLists");
   const [lists, setLists] = useState([]);
   const [loading, setLoading] = useState(true);
   const [showAdd, setShowAdd] = useState(false);
@@ -328,7 +331,7 @@ export default function PriceLists() {
     }
   };
 
-  if (!isAdmin) return <div className="p-6 text-slate-500">Admin only.</div>;
+  if (!isAdmin && !can("priceLists")) return <div className="p-6 text-slate-500">Admin only.</div>;
 
   // -------------------- List view --------------------
   if (!active) {
@@ -342,13 +345,13 @@ export default function PriceLists() {
               Maintain multiple customer price lists. Assign one to each party from the Customers page.
             </p>
           </div>
-          <Button
+          {canAdd && <Button
             onClick={() => setShowAdd(true)}
             data-testid="add-price-list-btn"
             className="bg-[#E65100] hover:bg-[#CC4800] text-white rounded-sm h-10 px-4 font-bold"
           >
             <Plus className="w-4 h-4 mr-1.5" /> New price list
-          </Button>
+          </Button>}
         </div>
 
         <div className="bg-white border border-slate-200 rounded-sm">
@@ -364,7 +367,7 @@ export default function PriceLists() {
                 <div
                   key={pl.id}
                   data-testid={`price-list-row-${pl.id}`}
-                  className="p-4 sm:p-5 flex items-center justify-between gap-3 hover:bg-slate-50 transition-colors"
+                  className="p-4 sm:p-5 flex flex-col lg:flex-row lg:items-center justify-between gap-3 hover:bg-slate-50 transition-colors"
                 >
                   <button
                     onClick={() => setActive(pl)}
@@ -375,15 +378,15 @@ export default function PriceLists() {
                     {pl.description && (
                       <div className="text-xs text-slate-500 mt-0.5">{pl.description}</div>
                     )}
-                    <div className="flex gap-3 mt-1.5 flex-wrap">
-                      <span className="text-[10px] uppercase tracking-wider font-bold bg-orange-50 border border-orange-200 text-orange-900 px-2 py-1 rounded-sm">
+                    <div className="flex gap-2 mt-1.5 flex-wrap">
+                      <span className="text-[10px] uppercase tracking-wider font-bold bg-orange-50 border border-orange-200 text-orange-900 px-2 py-1 rounded-sm whitespace-nowrap">
                         {pl.items_count} items priced
                       </span>
-                      <span className="text-[10px] uppercase tracking-wider font-bold bg-slate-50 border border-slate-200 text-slate-700 px-2 py-1 rounded-sm">
+                      <span className="text-[10px] uppercase tracking-wider font-bold bg-slate-50 border border-slate-200 text-slate-700 px-2 py-1 rounded-sm whitespace-nowrap">
                         {pl.discounts_count} category discounts
                       </span>
                       <span
-                        className={`text-[10px] uppercase tracking-wider font-bold px-2 py-1 rounded-sm border ${
+                        className={`text-[10px] uppercase tracking-wider font-bold px-2 py-1 rounded-sm border whitespace-nowrap ${
                           pl.customers_count > 0
                             ? "bg-emerald-50 border-emerald-200 text-emerald-800"
                             : "bg-slate-50 border-slate-200 text-slate-500"
@@ -393,7 +396,7 @@ export default function PriceLists() {
                         {pl.customers_count || 0} customer{pl.customers_count === 1 ? "" : "s"} linked
                       </span>
                       <span
-                        className={`text-[10px] uppercase tracking-wider font-bold px-2 py-1 rounded-sm border inline-flex items-center gap-1 ${
+                        className={`text-[10px] uppercase tracking-wider font-bold px-2 py-1 rounded-sm border inline-flex items-center gap-1 whitespace-nowrap ${
                           (pl.bill_amount_required ?? true)
                             ? "bg-orange-50 border-orange-200 text-orange-900"
                             : "bg-slate-100 border-slate-300 text-slate-600"
@@ -408,13 +411,14 @@ export default function PriceLists() {
                       </span>
                     </div>
                   </button>
-                  {isAdmin && (
+                  <div className="flex flex-wrap items-center gap-2 shrink-0" data-testid={`price-list-actions-${pl.id}`}>
+                  {canEdit && (
                     <div
-                      className="flex flex-col items-center gap-0.5 pr-2 border-r border-slate-200"
+                      className="flex items-center gap-2 pr-2 border-r border-slate-200"
                       onClick={(e) => e.stopPropagation()}
                       data-testid={`price-list-billreq-wrap-${pl.id}`}
                     >
-                      <span className="text-[9px] uppercase tracking-wider font-bold text-slate-500">
+                      <span className="text-[9px] uppercase tracking-wider font-bold text-slate-500 whitespace-nowrap">
                         Bill required
                       </span>
                       <Switch
@@ -433,7 +437,7 @@ export default function PriceLists() {
                   >
                     <Edit3 className="w-3.5 h-3.5 mr-1" /> Manage
                   </Button>
-                  <Button
+                  {canEdit && <Button
                     size="sm"
                     variant="outline"
                     onClick={() => openEditDialog(pl)}
@@ -442,8 +446,8 @@ export default function PriceLists() {
                     title="Rename this price list"
                   >
                     <Edit3 className="w-3.5 h-3.5 mr-1" /> Edit name
-                  </Button>
-                  <Button
+                  </Button>}
+                  {canAdd && <Button
                     size="sm"
                     variant="outline"
                     onClick={() => openCloneDialog(pl)}
@@ -451,8 +455,8 @@ export default function PriceLists() {
                     className="rounded-sm border-slate-300 text-slate-700 hover:bg-orange-50 hover:text-[#E65100] hover:border-orange-200"
                   >
                     <Copy className="w-3.5 h-3.5 mr-1" /> Clone
-                  </Button>
-                  <Button
+                  </Button>}
+                  {canDelete && <Button
                     size="sm"
                     variant="outline"
                     onClick={() => deleteList(pl)}
@@ -460,7 +464,8 @@ export default function PriceLists() {
                     className="rounded-sm border-rose-200 text-rose-600 hover:bg-rose-50 hover:text-rose-700"
                   >
                     <Trash2 className="w-3.5 h-3.5" />
-                  </Button>
+                  </Button>}
+                  </div>
                 </div>
               ))}
             </div>
@@ -683,14 +688,14 @@ export default function PriceLists() {
             }}
             data-testid="price-list-upload-input"
           />
-          <Button
+          {canAdd && <Button
             variant="outline"
             onClick={() => fileInputRef.current?.click()}
             data-testid="upload-price-xlsx"
             className="rounded-sm border-slate-300 h-9"
           >
             <Upload className="w-4 h-4 mr-1.5" /> Upload Excel
-          </Button>
+          </Button>}
           <Button
             variant="outline"
             onClick={downloadXlsx}
@@ -702,7 +707,7 @@ export default function PriceLists() {
           {/* Task 3 — De-link from all customers in one click. Always
               visible to admins so the affordance is discoverable; disabled
               when no customer is linked. */}
-          {isAdmin && (
+          {canEdit && (
             <Button
               variant="outline"
               onClick={() => delinkList(active, detail.customers_count || 0)}
@@ -740,6 +745,7 @@ export default function PriceLists() {
                   value={d.discount_value}
                   type={d.discount_type}
                   onSave={saveDiscount}
+                  readOnly={!canEdit}
                 />
               );
             })}
@@ -773,6 +779,7 @@ export default function PriceLists() {
                 row={r}
                 saving={savingRow === r.item_id}
                 onSave={(p) => saveRow(r, p)}
+                readOnly={!canEdit}
               />
             ))}
           </div>
@@ -791,7 +798,7 @@ export default function PriceLists() {
   );
 }
 
-function PriceRow({ row, onSave, saving }) {
+function PriceRow({ row, onSave, saving, readOnly }) {
   const [val, setVal] = useState(String(row.price ?? 0));
   useEffect(() => { setVal(String(row.price ?? 0)); }, [row.price]);
   const dirty = parseFloat(val || "0") !== parseFloat(row.price || 0);
@@ -829,6 +836,7 @@ function PriceRow({ row, onSave, saving }) {
             min="0"
             step="0.01"
             value={val}
+            disabled={readOnly}
             onChange={(e) => setVal(e.target.value)}
             onFocus={(e) => { if (parseFloat(val || "0") === 0) setVal(""); e.target.select(); }}
             onBlur={() => {
@@ -839,11 +847,12 @@ function PriceRow({ row, onSave, saving }) {
             className="no-spinner h-9 w-28 pl-7 rounded-sm font-mono-num text-right"
           />
         </div>
-        {dirty && (
+        {dirty && !readOnly && (
           <Button
             size="sm"
             onClick={() => onSave(val)}
             disabled={saving}
+            data-testid={`price-save-${row.item_id}`}
             className="bg-[#E65100] hover:bg-[#CC4800] text-white rounded-sm h-9 px-3"
           >
             <Save className="w-3.5 h-3.5" />
@@ -854,7 +863,7 @@ function PriceRow({ row, onSave, saving }) {
   );
 }
 
-function DiscountRow({ category, value, type, onSave }) {
+function DiscountRow({ category, value, type, onSave, readOnly }) {
   const [val, setVal] = useState(String(value || 0));
   const [tp, setTp] = useState(type || "");
   useEffect(() => { setVal(String(value || 0)); setTp(type || ""); }, [value, type]);
@@ -878,6 +887,7 @@ function DiscountRow({ category, value, type, onSave }) {
           min="0"
           step="0.01"
           value={val}
+          disabled={readOnly}
           onChange={(e) => setVal(e.target.value)}
           onFocus={(e) => { if (parseFloat(val || "0") === 0) setVal(""); e.target.select(); }}
           onBlur={() => { if (val === "" || val === "-" || val === ".") setVal("0"); }}
@@ -887,22 +897,24 @@ function DiscountRow({ category, value, type, onSave }) {
         <div className="flex">
           <button
             type="button"
+            disabled={readOnly}
             onClick={() => setTp(tp === "₹" ? "" : "₹")}
             data-testid={`discount-type-rs-${category}`}
-            className={`h-9 px-2 rounded-l-sm border text-xs font-bold ${tp === "₹" ? "bg-[#E65100] text-white border-[#E65100]" : `bg-white text-slate-700 ${needsType ? "border-rose-400" : "border-slate-300"}`}`}
+            className={`h-9 px-2 rounded-l-sm border text-xs font-bold disabled:opacity-50 disabled:cursor-not-allowed ${tp === "₹" ? "bg-[#E65100] text-white border-[#E65100]" : `bg-white text-slate-700 ${needsType ? "border-rose-400" : "border-slate-300"}`}`}
           >
             <IndianRupee className="w-3 h-3 inline -mt-0.5" />
           </button>
           <button
             type="button"
+            disabled={readOnly}
             onClick={() => setTp(tp === "%" ? "" : "%")}
             data-testid={`discount-type-pct-${category}`}
-            className={`h-9 px-2 rounded-r-sm border -ml-px text-xs font-bold ${tp === "%" ? "bg-[#E65100] text-white border-[#E65100]" : `bg-white text-slate-700 ${needsType ? "border-rose-400" : "border-slate-300"}`}`}
+            className={`h-9 px-2 rounded-r-sm border -ml-px text-xs font-bold disabled:opacity-50 disabled:cursor-not-allowed ${tp === "%" ? "bg-[#E65100] text-white border-[#E65100]" : `bg-white text-slate-700 ${needsType ? "border-rose-400" : "border-slate-300"}`}`}
           >
             <Percent className="w-3 h-3 inline -mt-0.5" />
           </button>
         </div>
-        <Button
+        {!readOnly && <Button
           size="sm"
           onClick={() => onSave(category, val, tp)}
           disabled={!dirty}
@@ -910,7 +922,7 @@ function DiscountRow({ category, value, type, onSave }) {
           className="bg-[#E65100] hover:bg-[#CC4800] text-white rounded-sm h-9 px-3 disabled:opacity-40"
         >
           <Save className="w-3.5 h-3.5" />
-        </Button>
+        </Button>}
       </div>
     </div>
   );

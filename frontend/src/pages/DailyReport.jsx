@@ -50,7 +50,8 @@ const isLudhianaLocation = (...parts) => {
 };
 
 export default function DailyReport() {
-  const { isAdmin } = useAuth();
+  const { isAdmin, canAct } = useAuth();
+  const canEditLedger = canAct("edit:customerLedger");
   const [date, setDate] = useState(todayYmd());
   // Single day vs multi-day range. In range mode the report covers
   // [date .. endDate] inclusive (IST days).
@@ -576,7 +577,7 @@ body { padding: 12mm; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI"
                     <ChevronDown className="w-4 h-4 text-slate-500 print:hidden" />
                   )}
                   <div className="flex-1 min-w-0">
-                    <div className="font-heading font-bold text-slate-900 text-base truncate flex items-center gap-2">
+                    <div className="font-heading font-bold text-slate-900 text-base break-words flex flex-wrap items-center gap-x-2 gap-y-1">
                       {g.customer_name}
                       {isPartyComplete ? (
                         <span className="text-[10px] font-extrabold uppercase tracking-wider px-2 py-0.5 rounded-sm bg-emerald-600 text-white"
@@ -763,10 +764,10 @@ body { padding: 12mm; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI"
                         return (
                           <div
                             key={dsp.id}
-                            className="grid grid-cols-1 sm:grid-cols-12 gap-2 items-end"
+                            className="grid grid-cols-2 sm:grid-cols-12 gap-2 items-end"
                             data-testid={`report-dispatch-edit-${dsp.id}`}
                           >
-                            <div className="sm:col-span-2 text-xs uppercase tracking-wider text-slate-800 font-extrabold flex items-center gap-1.5 flex-wrap">
+                            <div className="col-span-2 text-xs uppercase tracking-wider text-slate-800 font-extrabold flex items-center gap-1.5 flex-wrap">
                               <span className="inline-flex items-baseline gap-1.5 px-2 py-1 rounded-sm bg-orange-50 border border-orange-200">
                                 <span className="text-[11px] text-[#E65100]">Slip #</span>
                                 <span className="font-mono text-sm font-black text-slate-900 tabular-nums">{dsp.slip_no ?? dsp.id.slice(0, 8).toUpperCase()}</span>
@@ -818,7 +819,7 @@ body { padding: 12mm; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI"
                                   disabled={!canEdit}
                                   title={canEdit ? "" : lockMsg}
                                   data-testid={`report-grdate-input-${dsp.id}`}
-                                  className={`h-9 rounded-sm ${showLabels ? "mt-0.5" : ""} disabled:bg-slate-50 disabled:cursor-not-allowed`}
+                                  className={`h-9 w-full min-w-0 px-2 text-sm rounded-sm ${showLabels ? "mt-0.5" : ""} disabled:bg-slate-50 disabled:cursor-not-allowed`}
                                 />
                               )}
                             </div>
@@ -830,9 +831,9 @@ body { padding: 12mm; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI"
                                 <Input
                                   type="number" min="0" step="0.01"
                                   value={tvVal}
-                                  placeholder="Enter bill amount"
-                                  disabled={!canEdit}
-                                  title={canEdit ? "" : lockMsg}
+                                  placeholder="Bill amount"
+                                  disabled={!canEdit || !canEditLedger}
+                                  title={!canEditLedger ? "Needs \"Edit customer ledger\" access" : (canEdit ? "" : lockMsg)}
                                   onChange={(e) => updEdit("dispatch", dsp.id, { total_value: e.target.value })}
                                   onFocus={(e) => { if (parseFloat(tvVal || "0") === 0) updEdit("dispatch", dsp.id, { total_value: "" }); e.target.select(); }}
                                   onBlur={() => { if (tvVal === "" || tvVal === "-") updEdit("dispatch", dsp.id, { total_value: "0" }); }}
@@ -854,8 +855,8 @@ body { padding: 12mm; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI"
                                 size="sm"
                                 variant="outline"
                                 onClick={() => setEditingDispatch({ ...dsp, _customerCity: g.city || "", _customerLocation: g.location || "", _customerAddress: g.address || "" })}
-                                disabled={!canEdit}
-                                title={canEdit ? "Edit items, GR & bill" : lockMsg}
+                                disabled={!canEdit || !canEditLedger}
+                                title={!canEditLedger ? "Needs \"Edit customer ledger\" access" : (canEdit ? "Edit items, GR & bill" : lockMsg)}
                                 data-testid={`report-dispatch-edit-btn-${dsp.id}`}
                                 className="rounded-sm h-9 w-full border-slate-300 disabled:opacity-40"
                               >
@@ -870,10 +871,10 @@ body { padding: 12mm; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI"
                           One button persists GR + Bill (per dispatch) AND
                           private mark + bag count (per party) in a single
                           click. Ludhiana parties skip pvt mark + bags. */}
-                      <div className="grid grid-cols-1 sm:grid-cols-12 gap-2 items-end pt-2 border-t border-orange-100">
+                      <div className="grid grid-cols-2 sm:grid-cols-12 gap-2 items-end pt-2 border-t border-orange-100">
                           {!ludhiana && (
                             <>
-                              <div className="sm:col-span-2 text-[10px] uppercase tracking-wider font-bold flex items-center gap-1"
+                              <div className="col-span-2 text-[10px] uppercase tracking-wider font-bold flex items-center gap-1"
                                    style={{ color: g.bill_number_mode ? "#4338CA" : undefined }}>
                                 <Tag className="w-3 h-3" /> {g.bill_number_mode ? "Bill Number" : "Private mark"}
                               </div>
@@ -901,7 +902,7 @@ body { padding: 12mm; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI"
                                         : (g.private_mark || "")
                                     }
                                     onChange={(e) => updEdit("customer", g.customer_id, { private_mark: e.target.value })}
-                                    placeholder="Stenciled mark on packages (e.g. AB)"
+                                    placeholder="e.g. AB"
                                     data-testid={`report-pvtmark-input-${g.customer_id}`}
                                     className="h-9 rounded-sm mt-0.5"
                                   />
@@ -931,7 +932,7 @@ body { padding: 12mm; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI"
                             </>
                           )}
                           {ludhiana && (
-                            <div className="sm:col-span-10 text-[11px] text-slate-500 italic flex items-center gap-1.5"
+                            <div className="col-span-2 sm:col-span-10 text-[11px] text-slate-500 italic flex items-center gap-1.5"
                                  data-testid={`report-ludhiana-note-${g.customer_id}`}>
                               <Tag className="w-3 h-3 text-slate-400" />
                               Ludhiana party · GR number, private mark and no. of bags are not required.
@@ -949,7 +950,7 @@ body { padding: 12mm; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI"
                             const anyEditable = (g.dispatches || []).some((d) => d.can_edit !== false);
                             const isSaving = savingKey === `party:${g.customer_id}`;
                             return (
-                              <div className="sm:col-span-2 flex">
+                              <div className="col-span-2 flex">
                                 <Button
                                   size="sm"
                                   onClick={() => saveAllForParty(g.customer_id, g.dispatches)}

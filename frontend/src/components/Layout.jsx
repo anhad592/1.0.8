@@ -11,6 +11,7 @@ import { Button } from "@/components/ui/button";
 import LanguageSwitcher from "@/components/LanguageSwitcher";
 import BrandMark from "@/components/BrandMark";
 import VoiceAgent from "@/components/VoiceAgent";
+import { APP_VERSION } from "@/constants/version";
 import NotificationCenter from "@/components/NotificationCenter";
 
 // Top-level nav items always visible in the main sidebar.
@@ -124,8 +125,11 @@ export default function Layout() {
         <div className="px-3 py-2">
           <div className="text-xs text-slate-400">{t("nav.signedInAs")}</div>
           <div className="text-sm text-white font-bold font-mono-num">{user?.username || user?.email}</div>
-          <div className="mt-1 inline-block text-[10px] uppercase tracking-[0.1em] px-1.5 py-0.5 bg-[#E65100] text-white font-bold rounded-sm">
-            {user?.role}
+          <div className="mt-1.5 flex items-center justify-between gap-2">
+            <span className="text-[10px] uppercase tracking-[0.1em] px-1.5 py-0.5 bg-[#E65100] text-white font-bold rounded-sm">
+              {user?.role}
+            </span>
+            <span className="text-xs font-mono-num font-bold text-white bg-white/5 border border-white/15 px-2 py-0.5 rounded-sm" data-testid="sidebar-app-version">v{APP_VERSION}</span>
           </div>
         </div>
         <Button onClick={handleLogout} data-testid="logout-btn"
@@ -159,23 +163,24 @@ export default function Layout() {
             controls inside stay below the dynamic island / notch, and the
             white bg fills the status-bar strip on iPhone PWA. */}
         <header
-          className="sticky top-0 z-30 bg-white border-b border-slate-200 flex items-center gap-3 pt-[env(safe-area-inset-top)] pl-[calc(1rem+env(safe-area-inset-left))] pr-[calc(1rem+env(safe-area-inset-right))] sm:pl-[calc(1.5rem+env(safe-area-inset-left))] sm:pr-[calc(1.5rem+env(safe-area-inset-right))]"
+          className="sticky top-0 z-30 bg-white border-b border-slate-200 flex items-center gap-2 sm:gap-3 pt-[env(safe-area-inset-top)] pl-[calc(1rem+env(safe-area-inset-left))] pr-[calc(1rem+env(safe-area-inset-right))] sm:pl-[calc(1.5rem+env(safe-area-inset-left))] sm:pr-[calc(1.5rem+env(safe-area-inset-right))]"
           style={{ minHeight: "calc(3.5rem + env(safe-area-inset-top))" }}
         >
           <button data-testid="mobile-menu-btn" className="md:hidden p-2 -ml-2" onClick={() => setOpen(!open)}>
             {open ? <X className="w-5 h-5" /> : <Menu className="w-5 h-5" />}
           </button>
-          <div className="md:hidden">
-            <BrandMark size={28} variant="brand" />
+          <div className="md:hidden flex items-center gap-1.5 shrink-0">
+            <BrandMark size={26} variant="brand" />
+            <span className="font-heading font-bold text-slate-900 text-base leading-none" data-testid="topbar-app-name-mobile">JK</span>
           </div>
-          <div className="font-heading font-bold text-slate-900 truncate">{t("nav.appName")}</div>
-          <div className="ml-auto flex items-center gap-2">
+          <div className="hidden md:block font-heading font-bold text-slate-900 truncate min-w-0">{t("nav.appName")}</div>
+          <div className="ml-auto flex items-center gap-1.5 sm:gap-2 shrink-0">
             <NotificationCenter />
             <LanguageSwitcher />
-            <Button onClick={() => nav("/orders/new")} data-testid="topbar-new-order"
-                    className="bg-[#E65100] hover:bg-[#CC4800] text-white rounded-sm h-10 px-4 font-bold active:scale-[0.98]">
-              <Plus className="w-4 h-4 mr-1.5" /> <span className="hidden sm:inline">{t("nav.newOrder")}</span><span className="sm:hidden">{t("nav.new")}</span>
-            </Button>
+            {(can("newOrder") || can("orders")) && <Button onClick={() => nav("/orders/new")} data-testid="topbar-new-order"
+                    className="bg-[#E65100] hover:bg-[#CC4800] text-white rounded-sm h-10 px-3 sm:px-4 font-bold active:scale-[0.98]">
+              <Plus className="w-4 h-4 max-[359px]:mr-0 mr-1 sm:mr-1.5" /> <span className="hidden sm:inline">{t("nav.newOrder")}</span><span className="sm:hidden max-[359px]:hidden">{t("nav.new")}</span>
+            </Button>}
           </div>
         </header>
 
