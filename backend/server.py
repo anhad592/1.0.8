@@ -2,6 +2,7 @@ from fastapi import FastAPI, APIRouter, HTTPException, Depends, UploadFile, File
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
+from starlette.middleware.gzip import GZipMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
 import os
 import io
@@ -12,7 +13,7 @@ import base64
 import logging
 from pathlib import Path
 from pydantic import BaseModel, Field, EmailStr, ConfigDict
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Literal
 import uuid
 from datetime import datetime, timezone, timedelta
 import jwt
@@ -281,6 +282,7 @@ class CustomerIn(BaseModel):
     private_mark: Optional[str] = ""     # stenciled mark on packages for this party
     bill_number_mode: Optional[bool] = False  # if True, this party uses a manually-typed Bill Number at dispatch instead of a Private Marka
     blocked_items: List[str] = []        # item_ids that must never be ordered/dispatched for this party
+    order_handling_mode: Optional[Literal["clear", "retain"]] = "retain"  # clear = new order clears old pending ones
 
 
 class CustomerUpdate(BaseModel):
@@ -295,6 +297,7 @@ class CustomerUpdate(BaseModel):
     private_mark: Optional[str] = None
     bill_number_mode: Optional[bool] = None
     blocked_items: Optional[List[str]] = None
+    order_handling_mode: Optional[Literal["clear", "retain"]] = None
 
 
 class OrderItemIn(BaseModel):
@@ -2002,6 +2005,13 @@ async def create_order(body: OrderIn, user=Depends(require_action("add:orders"))
                 detail=f"These items are blocked for {cust.get('name') or 'this party'}: {', '.join(names)}",
             )
 
+    # Party-level "Order Handling Mode" overrides the per-order choice.
+    mode = cust.get("order_handling_mode")
+    if mode == "clear":
+        body.clear_previous_pending, body.merge_with_pending = True, False
+    elif mode == "retain":
+        body.clear_previous_pending, body.merge_with_pending = False, False
+
     # If clear_previous_pending: mark all this customer's pending orders as Cleared
     if body.clear_previous_pending:
         await db.orders.update_many(
@@ -3077,9 +3087,7 @@ async def dispatch_execute(body: DispatchExecuteIn, user=Depends(require_action(
     # from item pricing — it must be entered manually by the operator in
     # Daily Report / Dispatch Ledger edit. New dispatches start at 0.
     dispatch_ts = _resolve_dispatch_ts(body.dispatched_at)
-    existing = await _find_open_dispatch_today(
-        order["customer_id"], order["customer_name"], for_iso_ts=dispatch_ts,
-    )
+    existing = None  # every dispatch gets its own slip (no same-day merge)
     if existing:
         merged_items = _merge_dispatch_lines(existing.get("items") or [], dispatched_lines)
         merged_total_pcs = sum(int(it.get("quantity") or 0) for it in merged_items)
@@ -3197,6 +3205,7 @@ async def next_slip_no() -> int:
 async def _find_open_dispatch_today(
     customer_id: Optional[str], customer_name: Optional[str],
     for_iso_ts: Optional[str] = None,
+    price_list_id: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
     """Find an existing dispatch slip created on the SAME business day (IST)
     for the same customer. Used to merge multiple same-day dispatches into a
@@ -3227,6 +3236,9 @@ async def _find_open_dispatch_today(
     else:
         q["customer_id"] = None
         q["customer_name"] = (customer_name or "").strip()
+    # Only merge into a slip priced on the SAME price list — a dispatch made
+    # after the party's list changed gets its own slip.
+    q["price_list_id"] = price_list_id or None
     return await db.dispatches.find_one(q, {"_id": 0}, sort=[("dispatched_at", 1)])
 
 
@@ -4175,6 +4187,24 @@ async def delete_price_list(plid: str, admin=Depends(require_action("delete:pric
     return {"ok": True, "deleted": plid}
 
 
+class PriceListMoveCustomersIn(BaseModel):
+    from_price_list_id: str
+
+
+@api_router.post("/price-lists/{plid}/move-customers")
+async def move_price_list_customers(plid: str, body: PriceListMoveCustomersIn,
+                                    admin=Depends(require_action("edit:priceLists"))):
+    """Bulk re-link every customer on `from_price_list_id` to this list."""
+    if plid == body.from_price_list_id:
+        raise HTTPException(status_code=400, detail="Pick a different price list")
+    for pid in (plid, body.from_price_list_id):
+        if not await db.price_lists.find_one({"id": pid}, {"_id": 1}):
+            raise HTTPException(status_code=404, detail="Price list not found")
+    res = await db.customers.update_many(
+        {"price_list_id": body.from_price_list_id}, {"$set": {"price_list_id": plid}})
+    return {"ok": True, "moved": res.modified_count}
+
+
 @api_router.post("/price-lists/{plid}/clone")
 async def clone_price_list(plid: str, body: PriceListCloneIn, admin=Depends(require_action("add:priceLists"))):
     """Duplicate an existing price list under a new name, copying every
@@ -4561,7 +4591,8 @@ async def daily_dispatch_report(date: Optional[str] = None, end_date: Optional[s
         # they were dispatched — one group per (day, customer) — so the report
         # reads date-wise instead of merging a customer's whole range together.
         day = _ist_day(d.get("dispatched_at"))
-        gkey = f"{day}|{cid}" if range_mode else cid
+        # Every dispatch is its own slip → its own card in the report.
+        gkey = d.get("id") or f"{day}|{cid}"
         cust = customers_cache.get(cid)
         if cust is None and cid != "unknown":
             cust = await db.customers.find_one({"id": cid}, {"_id": 0}) or {}
@@ -4573,6 +4604,7 @@ async def daily_dispatch_report(date: Optional[str] = None, end_date: Optional[s
             pl_id = cust.get("price_list_id")
             pl_meta = await _price_list_meta(pl_id)
             g = {
+                "group_key": gkey,
                 "customer_id": cid,
                 "day": day,
                 "customer_name": d.get("customer_name") or cust.get("name") or "—",
@@ -4608,8 +4640,8 @@ async def daily_dispatch_report(date: Optional[str] = None, end_date: Optional[s
         for _raw in (d.get("items") or []):
             _stored_unit = float(_raw.get("unit_price") or 0)
             _stored_net = float(_raw.get("net_unit_price") or 0)
-            if _raw.get("price_override") and _stored_net > 0:
-                # Operator manually set a price via Edit dialog — respect it.
+            if _stored_net > 0:
+                # Price frozen on the slip at dispatch time (or manual edit) — respect it.
                 eff_unit = _stored_unit if _stored_unit > 0 else _stored_net
                 eff_net = _stored_net
             else:
@@ -4650,7 +4682,7 @@ async def daily_dispatch_report(date: Optional[str] = None, end_date: Optional[s
             # operator's saved net/unit price verbatim. Otherwise recompute
             # LIVE against the customer's currently-assigned price list +
             # discounts, so the report reflects any list changes.
-            if line.get("price_override") and float(line.get("net_unit_price") or 0) > 0:
+            if float(line.get("net_unit_price") or 0) > 0:
                 unit_price = float(line.get("unit_price") or 0)
                 discount_value = float(line.get("discount_value") or 0)
                 discount_type = line.get("discount_type") or ""
@@ -6235,7 +6267,7 @@ async def dispatch_off_order(body: OffOrderDispatchIn, user=Depends(require_acti
     # MERGE into today's existing slip for this customer if one exists, so
     # multiple same-day dispatches to one party produce ONE slip.
     dispatch_ts = _resolve_dispatch_ts(body.dispatched_at)
-    existing = await _find_open_dispatch_today(customer_id, customer_name, for_iso_ts=dispatch_ts)
+    existing = None  # every dispatch gets its own slip (no same-day merge)
     if existing:
         merged_items = _merge_dispatch_lines(existing.get("items") or [], dispatched_lines)
         merged_total_pcs = sum(int(it.get("quantity") or 0) for it in merged_items)
@@ -9647,6 +9679,159 @@ async def transport_bags_by_date(date: Optional[str] = None, _user=Depends(get_c
     return {"date": target.isoformat(), "by_transport": list(agg.values())}
 
 
+# ---------------- Activity audit log ----------------
+# Every add / edit / delete call made through the API is recorded with the
+# user, time, IP and a short summary. Read from Login Audit per user.
+_ACTIVITY_SKIP_PREFIXES = ("/api/auth/", "/api/ai/", "/api/voice", "/api/notifications")
+_ACTIVITY_SECRET_KEYS = {"password", "new_password", "old_password", "token", "otp", "code",
+                         "photo_b64", "gmail_app_password", "image", "file"}
+_UUIDISH = re.compile(r"^[0-9a-f]{8}-[0-9a-f-]{20,}$|^[0-9a-f]{24}$|^\d+$", re.I)
+
+
+_ACTIVITY_REF_COLLECTIONS = {
+    "customer_id": ("customers", "customer"), "supplier_id": ("suppliers", "vendor"),
+    "item_id": ("items", "item"), "product_id": ("products", "product"),
+    "price_list_id": ("price_lists", "price list"), "raw_material_id": ("raw_materials", "raw material"),
+    "transport_id": ("transports", "transport"), "vendor_price_list_id": ("vendor_price_lists", "vendor price list"),
+    "from_price_list_id": ("price_lists", "from price list"),
+}
+
+
+async def _activity_ref_name(key: str, val: Any, cache: Dict[str, str]) -> Optional[str]:
+    ref = _ACTIVITY_REF_COLLECTIONS.get(key)
+    if not ref or not isinstance(val, str) or not val:
+        return None
+    ck = f"{ref[0]}:{val}"
+    if ck not in cache:
+        doc = await _main_db[ref[0]].find_one({"id": val}, {"_id": 0, "name": 1})
+        cache[ck] = (doc or {}).get("name") or val[:8]
+    return cache[ck]
+
+
+async def _activity_line(line: Dict[str, Any], cache: Dict[str, str]) -> str:
+    name = line.get("item_name") or line.get("name") or line.get("product_name")
+    if not name:
+        for k in ("item_id", "raw_material_id", "product_id"):
+            name = await _activity_ref_name(k, line.get(k), cache)
+            if name:
+                break
+    qty = line.get("quantity", line.get("qty"))
+    return f"{name or 'item'}" + (f" × {qty}" if qty not in (None, "") else "")
+
+
+async def _activity_summary(body: Any, cache: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
+    """Readable snapshot of a request body: ids → names, item lists → 'Name × qty'."""
+    if not isinstance(body, dict):
+        return {}
+    cache = {} if cache is None else cache
+    out: Dict[str, Any] = {}
+    for k, v in body.items():
+        if k in _ACTIVITY_SECRET_KEYS or len(out) >= 20:
+            continue
+        if k in _ACTIVITY_REF_COLLECTIONS:
+            out[_ACTIVITY_REF_COLLECTIONS[k][1]] = await _activity_ref_name(k, v, cache) if v else v
+        elif isinstance(v, (str, int, float, bool)) or v is None:
+            out[k] = v if not isinstance(v, str) else v[:120]
+        elif isinstance(v, list):
+            if v and all(isinstance(x, dict) for x in v):
+                lines = [await _activity_line(x, cache) for x in v[:15]]
+                more = f" (+{len(v) - 15} more)" if len(v) > 15 else ""
+                out[k] = ", ".join(lines) + more
+            else:
+                out[k] = f"[{len(v)} item(s)]"
+    return out
+
+
+def _activity_target(body: Any) -> str:
+    if isinstance(body, dict):
+        for k in ("name", "customer_name", "item_name", "supplier_name", "username", "email", "title"):
+            if isinstance(body.get(k), str) and body[k].strip():
+                return body[k].strip()[:80]
+    return ""
+
+
+@app.middleware("http")
+async def activity_log_middleware(request: Request, call_next):
+    path = request.url.path
+    method = request.method.upper()
+    if method not in ("POST", "PUT", "PATCH", "DELETE") or not path.startswith("/api/") \
+            or path.startswith(_ACTIVITY_SKIP_PREFIXES):
+        return await call_next(request)
+    body_json: Any = None
+    ctype = request.headers.get("content-type", "")
+    if "application/json" in ctype:
+        try:
+            raw = await request.body()
+            if raw and len(raw) < 20000:
+                body_json = json.loads(raw)
+        except Exception:
+            body_json = None
+    response = await call_next(request)
+    try:
+        auth = request.headers.get("authorization", "")
+        if response.status_code >= 400 or not auth.lower().startswith("bearer "):
+            return response
+        payload = jwt.decode(auth[7:], JWT_SECRET, algorithms=[JWT_ALG])
+        user = await _main_db.users.find_one({"id": payload.get("sub")}, {"_id": 0, "password": 0})
+        if not user:
+            return response
+        parts = [p for p in path[len("/api/"):].split("/") if p]
+        record_id = next((p for p in parts if _UUIDISH.match(p)), None)
+        module_parts = [p for p in parts if not _UUIDISH.match(p)]
+        action = {"POST": "add", "PUT": "edit", "PATCH": "edit", "DELETE": "delete"}[method]
+        details = await _activity_summary(body_json)
+        await _main_db.activity_logs.insert_one({
+            "id": str(uuid.uuid4()),
+            "user_id": user.get("id"),
+            "user_email": user.get("email"),
+            "username": user.get("username"),
+            "user_name": user.get("name"),
+            "action": action,
+            "module": module_parts[0] if module_parts else "",
+            "path": "/" + "/".join(module_parts),
+            "record_id": record_id,
+            "target": _activity_target(body_json) or details.get("customer") or details.get("vendor") or "",
+            "details": details,
+            "method": method,
+            "status_code": response.status_code,
+            "success": response.status_code < 400,
+            "ip": _client_ip(request),
+            "blank_view": bool(user.get("blank_view")),
+            "created_at": now_iso(),
+        })
+    except Exception as e:
+        logger.warning(f"activity log skipped: {e}")
+    return response
+
+
+@api_router.get("/admin/activity-logs")
+async def list_activity_logs(
+    user_id: Optional[str] = None,
+    action: Optional[str] = None,
+    limit: int = 100,
+    skip: int = 0,
+    admin=Depends(require_admin),
+):
+    if is_blank_view(admin):
+        return {"total": 0, "items": []}
+    q: Dict[str, Any] = {"blank_view": {"$ne": True}}
+    if user_id:
+        q["user_id"] = user_id
+    if action in ("add", "edit", "delete"):
+        q["action"] = action
+    total = await _main_db.activity_logs.count_documents(q)
+    items = await _main_db.activity_logs.find(q, {"_id": 0}).sort("created_at", -1) \
+        .skip(max(0, int(skip))).limit(max(1, min(500, int(limit)))).to_list(500)
+    cache: Dict[str, str] = {}
+    for it in items:  # older entries stored raw ids — show names instead
+        det = it.get("details") or {}
+        if any(k in _ACTIVITY_REF_COLLECTIONS for k in det):
+            it["details"] = await _activity_summary(det, cache)
+            if not it.get("target"):
+                it["target"] = it["details"].get("customer") or it["details"].get("vendor") or ""
+    return {"total": total, "items": items}
+
+
 app.include_router(api_router)
 # The platform's liveness/readiness probe calls `GET /health` at the ROOT
 # (no /api prefix). Without this route the probe gets a 404 and the pod is
@@ -9666,6 +9851,7 @@ async def api_health():
     return {"status": "ok"}
 
 
+app.add_middleware(GZipMiddleware, minimum_size=1000)
 app.add_middleware(
     CORSMiddleware,
     allow_credentials=True,
@@ -9704,8 +9890,43 @@ async def migrate_add_permissions() -> int:
     return n
 
 
+_PERF_INDEXES = {
+    "orders": ["id", "customer_id", "status", "created_at"],
+    "dispatches": ["id", "customer_id", "dispatched_at", "order_id"],
+    "customers": ["id", "name", "price_list_id"],
+    "items": ["id", "product_id"],
+    "products": ["id"],
+    "users": ["id", "email", "username"],
+    "price_lists": ["id"],
+    "price_list_items": ["price_list_id", "item_id"],
+    "price_list_category_discounts": ["price_list_id"],
+    "suppliers": ["id"],
+    "supplier_purchases": ["id", "supplier_id"],
+    "raw_materials": ["id"],
+    "transports": ["id"],
+    "notifications": ["user_id"],
+    "login_attestations": ["user_id", "created_at"],
+    "order_activity": ["order_id"],
+}
+
+
+async def _ensure_perf_indexes():
+    for database in (_main_db, _blank_db):
+        for coll, fields in _PERF_INDEXES.items():
+            for f in fields:
+                try:
+                    await database[coll].create_index(f)
+                except Exception as e:
+                    logger.warning(f"index {coll}.{f} skipped: {e}")
+        try:
+            await database.price_list_items.create_index([("price_list_id", 1), ("item_id", 1)])
+        except Exception:
+            pass
+
+
 @app.on_event("startup")
 async def on_startup():
+    await _ensure_perf_indexes()
     await seed_db()
     await migrate_add_permissions()
     # Backfill: ensure every raw material has a numeric `stock_on_hand`.

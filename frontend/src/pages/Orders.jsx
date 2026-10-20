@@ -7,7 +7,7 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { toast } from "sonner";
-import { Plus, Search, Trash2, Edit3, AlertTriangle, Truck, Clock, CheckCircle2, MapPin, Undo2, History } from "lucide-react";
+import { Plus, Search, Trash2, Edit3, AlertTriangle, Truck, Clock, CheckCircle2, MapPin, Undo2, History, ChevronUp, ChevronDown } from "lucide-react";
 import { useAuth } from "@/lib/auth";
 import OrderEditDialog from "@/components/OrderEditDialog";
 import ConfirmDialog from "@/components/ConfirmDialog";
@@ -137,24 +137,55 @@ export default function Orders() {
     return () => clearTimeout(timer);
   }, [highlightId, orders]);
 
-  const filtered = orders.filter((o) => {
-    // Discrepancy view — only orders flagged with a timing discrepancy.
-    if (filter === "discrepancy" && !o.discrepancy) return false;
-    if (!q) return true;
-    const s = q.toLowerCase();
+  // Discrepancy view — only orders flagged with a timing discrepancy.
+  const filtered = orders.filter((o) => filter !== "discrepancy" || o.discrepancy);
+  // Search never hides orders — it marks matches inside the full list and
+  // lets the user jump between them.
+  const matchesQuery = (o) => {
+    const s = q.trim().toLowerCase();
+    if (!s) return false;
     return (o.customer_name || "").toLowerCase().includes(s) ||
            (o.customer_address || "").toLowerCase().includes(s) ||
            o.items?.some((it) =>
              (it.item_name || "").toLowerCase().includes(s) ||
              (it.product_name || "").toLowerCase().includes(s)
            );
-  });
+  };
+  const matchIds = q.trim() ? filtered.filter(matchesQuery).map((o) => o.id) : [];
+  const matchSet = new Set(matchIds);
+  const [matchIdx, setMatchIdx] = useState(0);
+  const jumpToMatch = (idx) => {
+    if (matchIds.length === 0) return;
+    const i = (idx + matchIds.length) % matchIds.length;
+    setMatchIdx(i);
+    const el = document.querySelector(`[data-testid="order-row-${matchIds[i]}"]`);
+    if (!el) return;
+    // Land the match just below the sticky top bar + search bar.
+    const bar = document.querySelector('[data-testid="orders-search-bar"]');
+    const topbarH = parseInt(getComputedStyle(document.documentElement).getPropertyValue("--topbar-h"), 10) || 64;
+    const offset = topbarH + (bar ? bar.offsetHeight : 64) + 8;
+    window.scrollTo({ top: el.getBoundingClientRect().top + window.scrollY - offset, behavior: "smooth" });
+  };
+  useEffect(() => {
+    if (!q.trim()) return;
+    const timer = setTimeout(() => jumpToMatch(0), 350);
+    return () => clearTimeout(timer);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [q, loading]);
+  const activeMatchId = matchIds[matchIdx];
+  // Clicking any non-matching order ends the search and freezes the page right there.
+  const stopSearchAt = (orderId) => {
+    if (!q.trim() || matchSet.has(orderId)) return;
+    window.scrollTo({ top: window.scrollY, behavior: "auto" });
+    setQ("");
+    setMatchIdx(0);
+  };
 
   const updateStatus = async (id, status) => {
     try {
       await api.patch(`/orders/${id}/status`, { status });
       toast.success(t("orders.markedStatus", { status: t(`orders.status.${status}`, status) }));
-      load();
+      load({ silent: true });
     } catch (e) { toast.error(t("common.failed")); }
   };
 
@@ -169,7 +200,9 @@ export default function Orders() {
         try {
           await api.delete(`/orders/${id}`);
           toast.success(t("orders.deleted"));
-          load();
+          // Drop the row in place and refresh silently — scroll position stays put.
+          setOrders((prev) => prev.filter((o) => o.id !== id));
+          load({ silent: true });
         } catch (e) { toast.error(t("common.failed")); }
       },
     });
@@ -223,15 +256,36 @@ export default function Orders() {
         : <ResyncOrders className="w-full" onApplied={() => load({ silent: true })} />)}
 
       <div className="bg-white border border-slate-200 rounded-sm">
-        <div className="p-4 border-b border-slate-200 flex flex-col sm:flex-row gap-3 sm:items-center">
-          <div className="relative flex-1 w-full">
+        <div className="sticky top-[var(--topbar-h,64px)] z-20 bg-white p-3 sm:p-4 border-b border-slate-200 flex flex-col sm:flex-row gap-2 sm:gap-3 sm:items-center shadow-[0_6px_12px_-10px_rgba(15,23,42,0.25)]" data-testid="orders-search-bar">
+          <div className="flex items-center gap-1.5 w-full sm:flex-1 min-w-0">
+          <div className="relative flex-1 min-w-0">
             <Search className="w-5 h-5 absolute left-3.5 top-1/2 -translate-y-1/2 text-slate-400" />
             <Input data-testid="orders-search" placeholder={t("orders.searchPlaceholder")}
                    value={q} onChange={(e) => setQ(e.target.value)}
-                   className="pl-11 h-12 text-base rounded-sm" />
+                   onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); jumpToMatch(e.shiftKey ? matchIdx - 1 : matchIdx + 1); } }}
+                   className="pl-11 h-11 sm:h-12 text-base rounded-sm" />
           </div>
+          {q.trim() && (
+            <div className="flex items-center gap-1.5 shrink-0" data-testid="orders-search-nav">
+              <span className="text-sm font-bold text-slate-700 font-mono-num whitespace-nowrap px-1" data-testid="orders-search-count">
+                {matchIds.length ? `${matchIdx + 1} / ${matchIds.length}` : "0 / 0"}
+              </span>
+              <Button type="button" variant="outline" size="icon" className="h-11 sm:h-12 w-10 sm:w-11 rounded-sm"
+                      disabled={!matchIds.length} onClick={() => jumpToMatch(matchIdx - 1)}
+                      data-testid="orders-search-prev" title="Previous match">
+                <ChevronUp className="w-4 h-4" />
+              </Button>
+              <Button type="button" variant="outline" size="icon" className="h-11 sm:h-12 w-10 sm:w-11 rounded-sm"
+                      disabled={!matchIds.length} onClick={() => jumpToMatch(matchIdx + 1)}
+                      data-testid="orders-search-next" title="Next match">
+                <ChevronDown className="w-4 h-4" />
+              </Button>
+            </div>
+          )}
+          </div>
+          <div className="flex items-center gap-2 w-full sm:w-auto">
           <Select value={filter} onValueChange={setFilter}>
-            <SelectTrigger data-testid="orders-filter" className="w-full sm:w-52 h-12 rounded-sm text-base">
+            <SelectTrigger data-testid="orders-filter" className="flex-1 sm:flex-none sm:w-52 h-11 sm:h-12 rounded-sm text-base">
               <SelectValue />
             </SelectTrigger>
             <SelectContent>
@@ -255,11 +309,12 @@ export default function Orders() {
           {discCount > 0 && filter !== "discrepancy" && (
             <button type="button" onClick={() => setFilter("discrepancy")}
                     data-testid="orders-discrepancy-pill"
-                    className="inline-flex items-center gap-1.5 h-12 px-3 rounded-sm border border-amber-300 bg-amber-50 text-amber-800 text-sm font-bold hover:bg-amber-100 transition whitespace-nowrap">
+                    className="inline-flex items-center gap-1.5 h-11 sm:h-12 px-3 rounded-sm border border-amber-300 bg-amber-50 text-amber-800 text-sm font-bold hover:bg-amber-100 transition whitespace-nowrap">
               <AlertTriangle className="w-4 h-4" />
               {discCount}
             </button>
           )}
+          </div>
         </div>
 
         {loading ? (
@@ -271,7 +326,7 @@ export default function Orders() {
         ) : (
           <div className="divide-y divide-slate-100">
             {filtered.map((o) => (
-              <div key={o.id} className={`p-4 sm:p-5 hover:bg-slate-50 transition-colors ${o.id === highlightId ? "bg-amber-100 ring-2 ring-inset ring-[#E65100]" : (o.is_overdue ? "bg-rose-50/40 border-l-2 border-l-rose-400" : "")}`} data-testid={`order-row-${o.id}`}>
+              <div key={o.id} className={`scroll-mt-24 p-4 sm:p-5 hover:bg-slate-50 transition-colors ${o.id === highlightId || o.id === activeMatchId ? "bg-amber-100 ring-2 ring-inset ring-[#E65100]" : matchSet.has(o.id) ? "bg-orange-50 border-l-4 border-l-[#E65100]" : (o.is_overdue ? "bg-rose-50/40 border-l-2 border-l-rose-400" : "")} ${q.trim() && !matchSet.has(o.id) ? "opacity-60" : ""}`} data-testid={`order-row-${o.id}`} data-search-match={matchSet.has(o.id) ? "true" : undefined} onClick={() => stopSearchAt(o.id)}>
                 <div className="flex items-start justify-between gap-3 flex-wrap">
                   <div className="flex-1 min-w-[200px]">
                     <div className="flex items-center gap-2 flex-wrap">

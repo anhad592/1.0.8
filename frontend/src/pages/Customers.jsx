@@ -34,11 +34,11 @@ export default function Customers() {
   const [loading, setLoading] = useState(true);
   const [q, setQ] = useState("");
   const [showAdd, setShowAdd] = useState(false);
-  const [form, setForm] = useState({ name: "", phone: "", address: "", city: "", location: "", transport_name: "", private_mark: "", bill_number_mode: false, price_list_id: "" });
+  const [form, setForm] = useState({ name: "", phone: "", address: "", city: "", location: "", transport_name: "", private_mark: "", bill_number_mode: false, price_list_id: "", order_handling_mode: "retain" });
   const [editing, setEditing] = useState(null);
   const [editPrefs, setEditPrefs] = useState({});
   const [editDetails, setEditDetails] = useState(null); // admin: name/phone/address edit
-  const [detailsForm, setDetailsForm] = useState({ name: "", phone: "", address: "", city: "", location: "", transport_name: "", private_mark: "", bill_number_mode: false, price_list_id: "" });
+  const [detailsForm, setDetailsForm] = useState({ name: "", phone: "", address: "", city: "", location: "", transport_name: "", private_mark: "", bill_number_mode: false, price_list_id: "", order_handling_mode: "retain" });
   // Bulk selection (admin)
   const [selectedIds, setSelectedIds] = useState(() => new Set());
   // Bulk import dialog
@@ -76,7 +76,7 @@ export default function Customers() {
         price_list_id: form.price_list_id || null,
       });
       toast.success(t("customers.added"));
-      setShowAdd(false); setForm({ name: "", phone: "", address: "", city: "", location: "", transport_name: "", private_mark: "", bill_number_mode: false, price_list_id: "" });
+      setShowAdd(false); setForm({ name: "", phone: "", address: "", city: "", location: "", transport_name: "", private_mark: "", bill_number_mode: false, price_list_id: "", order_handling_mode: "" });
       load();
     } catch (e) { toast.error(e?.response?.data?.detail || t("common.failed")); }
   };
@@ -107,6 +107,7 @@ export default function Customers() {
       private_mark: c.private_mark || "",
       bill_number_mode: !!c.bill_number_mode,
       price_list_id: c.price_list_id || "",
+      order_handling_mode: c.order_handling_mode || "",
     });
   };
 
@@ -116,6 +117,7 @@ export default function Customers() {
       await api.patch(`/customers/${editDetails.id}`, {
         ...detailsForm,
         price_list_id: detailsForm.price_list_id || null,
+        order_handling_mode: detailsForm.order_handling_mode || null,
       });
       toast.success(t("customers.detailsUpdated"));
       setEditDetails(null);
@@ -395,7 +397,7 @@ export default function Customers() {
 
       {/* Add Customer Dialog */}
       <Dialog open={showAdd} onOpenChange={setShowAdd}>
-        <DialogContent className="rounded-sm">
+        <DialogContent className="rounded-sm max-h-[90vh] overflow-y-auto">
           <DialogHeader>
             <DialogTitle className="font-heading">{t("customers.addTitle")}</DialogTitle>
             <DialogDescription>{t("customers.addSub")}</DialogDescription>
@@ -454,7 +456,7 @@ export default function Customers() {
                            setForm((p) => ({ ...p, private_mark: v, bill_number_mode: v ? p.bill_number_mode : false }));
                          }
                        }}
-                       placeholder="Type mark (letters) — digits switch to Bill Number"
+                       placeholder="Mark, e.g. AB"
                        data-testid="cust-add-private-mark"
                        className="h-11 rounded-sm disabled:bg-slate-100 disabled:text-slate-400" />
                 <Select
@@ -486,8 +488,13 @@ export default function Customers() {
                 ))}
               </select>
             </div>
+            <OrderHandlingModeField
+              value={form.order_handling_mode}
+              onChange={(v) => setForm((p) => ({ ...p, order_handling_mode: v }))}
+              testId="cust-add-order-mode"
+            />
           </div>
-          <DialogFooter>
+          <DialogFooter className="sticky -bottom-6 bg-white -mx-6 px-6 py-3 border-t border-slate-200 -mb-6">
             <Button variant="outline" onClick={() => setShowAdd(false)} className="rounded-sm">{t("common.cancel")}</Button>
             <Button onClick={save} data-testid="cust-add-save"
                     className="bg-[#E65100] hover:bg-[#CC4800] text-white rounded-sm">{t("common.save")}</Button>
@@ -537,7 +544,7 @@ export default function Customers() {
       </Dialog>
       {/* Edit Customer Details Dialog (admin) */}
       <Dialog open={!!editDetails} onOpenChange={(o) => !o && setEditDetails(null)}>
-        <DialogContent className="rounded-sm">
+        <DialogContent className="rounded-sm max-h-[90vh] overflow-y-auto">
           <DialogHeader>
             <DialogTitle className="font-heading">{t("customers.editDetailsTitle", { name: editDetails?.name })}</DialogTitle>
             <DialogDescription>{t("customers.editDetailsSub")}</DialogDescription>
@@ -599,7 +606,7 @@ export default function Customers() {
                            setDetailsForm((p) => ({ ...p, private_mark: v, bill_number_mode: v ? p.bill_number_mode : false }));
                          }
                        }}
-                       placeholder="Type mark (letters) — digits switch to Bill Number"
+                       placeholder="Mark, e.g. AB"
                        data-testid="cust-edit-private-mark"
                        className="h-11 rounded-sm disabled:bg-slate-100 disabled:text-slate-400" />
                 <Select
@@ -631,8 +638,13 @@ export default function Customers() {
                 ))}
               </select>
             </div>
+            <OrderHandlingModeField
+              value={detailsForm.order_handling_mode}
+              onChange={(v) => setDetailsForm((p) => ({ ...p, order_handling_mode: v }))}
+              testId="cust-edit-order-mode"
+            />
           </div>
-          <DialogFooter>
+          <DialogFooter className="sticky -bottom-6 bg-white -mx-6 px-6 py-3 border-t border-slate-200 -mb-6">
             <Button variant="outline" onClick={() => setEditDetails(null)} className="rounded-sm">
               <X className="w-4 h-4 mr-1" /> {t("common.cancel")}
             </Button>
@@ -753,6 +765,28 @@ export default function Customers() {
         customer={blockedCustomer}
         onSaved={load}
       />
+    </div>
+  );
+}
+
+function OrderHandlingModeField({ value, onChange, testId }) {
+  return (
+    <div>
+      <Label className="text-xs font-bold uppercase">Order Handling Mode</Label>
+      <Select value={value || undefined} onValueChange={onChange}>
+        <SelectTrigger data-testid={testId} className="mt-1 h-11 rounded-sm">
+          <SelectValue placeholder="Not set — ask on each new order" />
+        </SelectTrigger>
+        <SelectContent>
+          <SelectItem value="clear" data-testid={`${testId}-clear`}>Clear Previous</SelectItem>
+          <SelectItem value="retain" data-testid={`${testId}-retain`}>Retain Previous</SelectItem>
+        </SelectContent>
+      </Select>
+      <p className="text-[11px] text-slate-400 mt-1">
+        {value === "clear" ? "A new order clears this party's old pending orders."
+          : value === "retain" ? "A new order is added and old pending orders are kept."
+          : "You'll be asked each time this party has pending orders."}
+      </p>
     </div>
   );
 }
