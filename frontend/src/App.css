@@ -68,3 +68,12 @@
   }
 }
 
+
+/* ─── Orders list: render only visible rows (mobile OOM fix) ───
+   473 order rows ≈ 57k DOM nodes crashed the phone browser on scroll.
+   content-visibility:auto keeps the DOM (search / jump-to-match / highlight
+   keep working) but skips layout+paint for offscreen rows. */
+.order-row-cv {
+  content-visibility: auto;
+  contain-intrinsic-size: auto 240px;
+}

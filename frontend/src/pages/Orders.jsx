@@ -158,13 +158,25 @@ export default function Orders() {
     if (matchIds.length === 0) return;
     const i = (idx + matchIds.length) % matchIds.length;
     setMatchIdx(i);
-    const el = document.querySelector(`[data-testid="order-row-${matchIds[i]}"]`);
-    if (!el) return;
-    // Land the match just below the sticky top bar + search bar.
-    const bar = document.querySelector('[data-testid="orders-search-bar"]');
-    const topbarH = parseInt(getComputedStyle(document.documentElement).getPropertyValue("--topbar-h"), 10) || 64;
-    const offset = topbarH + (bar ? bar.offsetHeight : 64) + 8;
-    window.scrollTo({ top: el.getBoundingClientRect().top + window.scrollY - offset, behavior: "smooth" });
+    const rowId = matchIds[i];
+    // Rows render lazily (content-visibility), so offscreen heights are
+    // estimates — a single scroll can land short/past. Re-aim a few times:
+    // each landing renders nearby rows at their real height, so the next
+    // estimate converges on the target.
+    let tries = 0;
+    const go = () => {
+      const el = document.querySelector(`[data-testid="order-row-${rowId}"]`);
+      if (!el) return;
+      const bar = document.querySelector('[data-testid="orders-search-bar"]');
+      const topbarH = parseInt(getComputedStyle(document.documentElement).getPropertyValue("--topbar-h"), 10) || 64;
+      const offset = topbarH + (bar ? bar.offsetHeight : 64) + 8;
+      const gap = el.getBoundingClientRect().top - offset;
+      if (Math.abs(gap) < 24 || tries >= 5) return;
+      window.scrollTo({ top: window.scrollY + gap, behavior: "auto" });
+      tries += 1;
+      setTimeout(go, 140);
+    };
+    go();
   };
   useEffect(() => {
     if (!q.trim()) return;
@@ -326,7 +338,7 @@ export default function Orders() {
         ) : (
           <div className="divide-y divide-slate-100">
             {filtered.map((o) => (
-              <div key={o.id} className={`scroll-mt-24 p-4 sm:p-5 hover:bg-slate-50 transition-colors ${o.id === highlightId || o.id === activeMatchId ? "bg-amber-100 ring-2 ring-inset ring-[#E65100]" : matchSet.has(o.id) ? "bg-orange-50 border-l-4 border-l-[#E65100]" : (o.is_overdue ? "bg-rose-50/40 border-l-2 border-l-rose-400" : "")} ${q.trim() && !matchSet.has(o.id) ? "opacity-60" : ""}`} data-testid={`order-row-${o.id}`} data-search-match={matchSet.has(o.id) ? "true" : undefined} onClick={() => stopSearchAt(o.id)}>
+              <div key={o.id} className={`order-row-cv scroll-mt-24 p-4 sm:p-5 hover:bg-slate-50 transition-colors ${o.id === highlightId || o.id === activeMatchId ? "bg-amber-100 ring-2 ring-inset ring-[#E65100]" : matchSet.has(o.id) ? "bg-orange-50 border-l-4 border-l-[#E65100]" : (o.is_overdue ? "bg-rose-50/40 border-l-2 border-l-rose-400" : "")} ${q.trim() && !matchSet.has(o.id) ? "opacity-60" : ""}`} data-testid={`order-row-${o.id}`} data-search-match={matchSet.has(o.id) ? "true" : undefined} onClick={() => stopSearchAt(o.id)}>
                 <div className="flex items-start justify-between gap-3 flex-wrap">
                   <div className="flex-1 min-w-[200px]">
                     <div className="flex items-center gap-2 flex-wrap">
